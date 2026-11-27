@@ -101,13 +101,15 @@ class Transport:
 
     def fetch(self, branch=None, required=True):
         branch = branch or self.branch
-        for attempt in range(6):
+        attempts = 6
+        for attempt in range(attempts):
             result = git(self.root, 'fetch', '--quiet', '--no-tags', self.remote,
                          f'+refs/heads/{branch}:{self.ref(branch)}', check=False)
-            # Sessions sharing one clone can race on the remote-tracking ref lock; that is transient.
-            if result.returncode == 0 or 'lock' not in result.stderr:
+            # Sessions sharing one clone race on the remote-tracking ref lock, and on Windows on writing
+            # the same loose objects; both are transient. Anything else is reported at once.
+            if result.returncode == 0 or not TRANSIENT_FETCH.search(result.stderr) or attempt == attempts - 1:
                 break
-            time.sleep(0.2 * (attempt + 1))
+            time.sleep(random.uniform(0.1, 0.4) * (attempt + 1))
         if result.returncode:
             if required:
                 raise RuntimeError(f'Cannot fetch {self.remote}/{branch}: {result.stderr.strip()} '
@@ -140,6 +142,20 @@ class Transport:
     def state_path(self):
         return self.common_dir().resolve() / 'agent-stations' / 'state.json'
 
+    def build_commit(self, tip, changes, subject):
+        """A commit on `tip` applying `changes`, built in a temporary index (the real one is untouched)."""
+        with tempfile.TemporaryDirectory(prefix='station-mail-index-') as temporary:
+            env = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
+            git(self.root, 'read-tree', tip, env=env)
+            for path, content in changes.items():
+                if content is None:
+                    git(self.root, 'update-index', '--force-remove', '--', path, env=env)
+                else:
+                    blob = git(self.root, 'hash-object', '-w', '--stdin', data=content).stdout.strip()
+                    git(self.root, 'update-index', '--add', '--cacheinfo', f'100644,{blob},{path}', env=env)
+            tree = git(self.root, 'write-tree', env=env).stdout.strip()
+        return git(self.root, 'commit-tree', tree, '-p', tip, data=subject + '\n').stdout.strip()
+
     def append(self, prepare, subject, attempts=10):
         """Commit `prepare(tip)` changes ({path: bytes | None}) on the branch tip and push.
 
@@ -151,17 +167,14 @@ class Transport:
             changes = prepare(tip)
             if changes is None:
                 return None
-            with tempfile.TemporaryDirectory(prefix='station-mail-index-') as temporary:
-                env = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
-                git(self.root, 'read-tree', tip, env=env)
-                for path, content in changes.items():
-                    if content is None:
-                        git(self.root, 'update-index', '--force-remove', '--', path, env=env)
-                    else:
-                        blob = git(self.root, 'hash-object', '-w', '--stdin', data=content).stdout.strip()
-                        git(self.root, 'update-index', '--add', '--cacheinfo', f'100644,{blob},{path}', env=env)
-                tree = git(self.root, 'write-tree', env=env).stdout.strip()
-            commit = git(self.root, 'commit-tree', tree, '-p', tip, data=subject + '\n').stdout.strip()
+            try:
+                commit = self.build_commit(tip, changes, subject)
+            except RuntimeError:
+                # Concurrent writers on Windows can briefly lock the object store; retry the attempt.
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(random.uniform(0.1, 0.4) * (attempt + 1))
+                continue
             pushed = git(self.root, 'push', '--quiet', self.remote,
                          f'{commit}:refs/heads/{self.branch}', check=False)
             if pushed.returncode == 0:
@@ -213,6 +226,9 @@ def validate_config(config):
         require(isinstance(extra, dict) and valid_branch(extra.get('branch'))
                 and isinstance(extra.get('messages_dir'), str) and extra['messages_dir'].strip('/')
                 and '..' not in extra['messages_dir'], 'also_watch entries need a branch and a messages_dir')
+        hints = extra.get('session_stations', {})
+        require(isinstance(hints, dict) and all(isinstance(k, str) and k and isinstance(v, str) and v in stations for k, v in hints.items()),
+                'also_watch session_stations must map session-id patterns to stations')
     watched = [extra['branch'] for extra in config.get('also_watch', [])]
     # Each branch has one cursor, so each may be watched once.
     require(len(watched) == len(set(watched)), 'also_watch lists a branch more than once')
@@ -540,8 +556,13 @@ def inbox(transport, actor=None, issue=None):
 # ------------------------------------------------------------------------- watch
 
 
-def sender_key(actor):
-    return f"{str(actor.get('id', '?')).lower()}@{actor.get('station') or '?'}"
+# Local ref-lock and loose-object write races only; an authentication failure ("Permission denied (publickey)")
+# is permanent and reported at once.
+TRANSIENT_FETCH = re.compile(r'\block\b|unpack-objects failed|unable to create temporary file|unable to write', re.I)
+
+
+def sender_key(actor, station=None):
+    return f"{str(actor.get('id', '?')).lower()}@{station or actor.get('station') or '?'}"
 
 
 def plain(value, limit=120):
@@ -558,19 +579,30 @@ def route(config, sender):
     return None
 
 
-def classify(message, me, config, local_branches):
-    """Why `message` needs this station's coordinator, or None when it is quiet."""
+def classify(message, me, config, local_branches, inferred=None):
+    """Why `message` needs this station's coordinator, or None when it is quiet.
+
+    `inferred` is the station `session_stations` hints give stationless mail. The legacy
+    local-branch rules run first and are unaffected by it. Review routing then tries the
+    inferred key (`login/agent@station`) and falls back to the `@?` key when no rule
+    matches, except for mail inferred to come from this station, which never routes back here.
+    """
     if not isinstance(message, dict) or not isinstance(message.get('actor'), dict):
         return None
     actor, task = message['actor'], message.get('task') or {}
     if not isinstance(task, dict):
         return None
     station, branch = actor.get('station'), task.get('branch')
-    sender = sender_key(actor)
+    inferred = None if station else inferred
+    sender = sender_key(actor, inferred)
+    senders = [sender] + ([sender_key(actor)] if inferred and inferred != me else [])
     event, phase = plain(task.get('event'), 20), plain(task.get('phase') or '', 20)
     head = task.get('head') if isinstance(task.get('head'), str) and SHA.fullmatch(task['head']) else '?'
     ref = (f"#{plain(task.get('issue'), 12)} {plain(branch or '?', 100)} @ {head} "
            f"from {plain(sender, 120)} ({plain(actor.get('session_id'), 80)})")
+    if event == 'handoff' and task.get('recipient_station') == me:
+        # An explicit recipient decides first, older mail included.
+        return plain(f"{phase or 'handoff'} {task.get('verdict') or ''} for this station: ".replace('  ', ' ')) + ref
     legacy_local = station is None and branch in local_branches
     if legacy_local:
         # Older mail has no station. A verdict about a branch checked out here is for this station's
@@ -582,13 +614,12 @@ def classify(message, me, config, local_branches):
         if not task.get('pr_url'):
             return None  # not a usable review request
         # Routing decides, even for the sender's own station: the reviewer is a fresh session either way.
-        return f"review needed: {plain(task['pr_url'], 200)} {ref}" if route(config, sender) == me else None
-    if event == 'handoff' and task.get('recipient_station') == me:
-        return plain(f"{phase or 'handoff'} {task.get('verdict') or ''} for this station: ".replace('  ', ' ')) + ref
-    if station == me:
+        reviewer = next((r for r in (route(config, key) for key in senders) if r), None)
+        return f"review needed: {plain(task['pr_url'], 200)} {ref}" if reviewer == me else None
+    if (station or inferred) == me:
         return None
     watch = config.get('watch', {})
-    if any(fnmatch.fnmatchcase(sender, pattern.lower()) for pattern in watch.get('always_from', [])):
+    if any(fnmatch.fnmatchcase(key, pattern.lower()) for key in senders for pattern in watch.get('always_from', [])):
         return f'{event}/{phase or "-"} {ref}'
     if event == 'handoff':
         # An explicit recipient decides; the local-branch fallback is for older mail without one.
@@ -605,7 +636,17 @@ def local_branches(root):
     return {line[len('branch refs/heads/'):] for line in listing.splitlines() if line.startswith('branch refs/heads/')}
 
 
-def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None):
+def infer_station(message, session_stations):
+    """The station older (stationless) mail came from, by the first matching session-id pattern, or None."""
+    actor = message.get('actor') if isinstance(message, dict) else None
+    if not session_stations or not isinstance(actor, dict) or actor.get('station'):
+        return None
+    session = str(actor.get('session_id', '')).lower()
+    return next((station for pattern, station in session_stations.items()
+                 if fnmatch.fnmatchcase(session, pattern.lower())), None)
+
+
+def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None, session_stations=None):
     """Actionable lines for commits in start..end (start None: the last 24 hours)."""
     branches = local_branches(transport.root) if branches is None else branches
     if start and git(transport.root, 'merge-base', '--is-ancestor', start, end, check=False).returncode == 0:
@@ -620,7 +661,8 @@ def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None
             if status == 'A' and path.startswith(messages_dir + '/') and path.endswith('.json'):
                 raw = transport.show(commit, path)  # a failed read raises, so the cursor stays put
                 message = readable(raw, path, config['repo'], messages_dir)
-                reason = classify(message, me, config, branches) if message is not None else None
+                reason = (classify(message, me, config, branches, infer_station(message, session_stations))
+                          if message is not None else None)
                 if reason:
                     lines.append(f'{commit[:9]} {reason}')
             elif path == CONFIG_FILE and status == 'M':
@@ -679,9 +721,9 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
             config_tip = None  # force a fresh routing load next poll
         watched = []
         if not unreadable:  # routing verified
-            watched = [(transport.branch, MESSAGES)] + [(e['branch'], e['messages_dir'])
-                                                         for e in config.get('also_watch', [])]
-        for branch, messages_dir in watched:
+            watched = [(transport.branch, MESSAGES, None)] + [(e['branch'], e['messages_dir'], e.get('session_stations'))
+                                                               for e in config.get('also_watch', [])]
+        for branch, messages_dir, session_stations in watched:
             try:
                 # A failed lookup or fetch is an incomplete poll; only a branch the remote truly lacks is quiet.
                 tip = main_tip if branch == transport.branch else transport.remote_tip(branch, strict=True)
@@ -689,7 +731,8 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
                     continue
                 if branch != transport.branch and transport.fetch(branch, required=False) is None:
                     raise RuntimeError(f'fetch of {transport.remote}/{branch} at {tip} failed')
-                found += scan(transport, config, me, seen.get(branch), tip, messages_dir)
+                found += scan(transport, config, me, seen.get(branch), tip, messages_dir,
+                              session_stations=session_stations)
             except RuntimeError as error:
                 incomplete(branch, error)
                 continue
