@@ -383,5 +383,72 @@ class LegacyAndSameStation(unittest.TestCase):
         self.assertIn('cr_result approved', mail.classify(verdict, 'windows', {}, set()))
 
 
+class WorktreeReuseAndRereview(Fixture):
+    def commit(self, root, name, text):
+        (root / name).write_text(text, encoding='utf-8')
+        run(root, 'add', name)
+        run(root, 'commit', '-qm', name)
+        return run(root, 'rev-parse', 'HEAD')
+
+    def advance_main(self, name):
+        seed = self.base / 'seed'
+        (seed / name).write_text(name + '\n', encoding='utf-8')
+        run(seed, 'add', name)
+        run(seed, 'commit', '-qm', name)
+        run(seed, 'push', '-q', 'origin', 'HEAD:refs/heads/main')
+        run(self.primary, 'fetch', '-q', 'origin')
+
+    def test_released_worktrees_come_first_and_busy_ones_say_why(self):
+        busy = self.base / 'busy'
+        run(self.primary, 'worktree', 'add', '-q', '-b', 'busy-task', str(busy), 'origin/main')
+        author(busy)
+        self.commit(busy, 'work.txt', 'unmerged\n')
+        (self.root / 'scratch.txt').write_text('left behind', encoding='utf-8')
+        rows = {Path(r['path']).name: r for r in mail.worktrees(self.primary, 'origin/main')}
+        self.assertEqual({'windows-linked', 'busy'}, set(rows))
+        self.assertIn('uncommitted or untracked work', rows['windows-linked']['blocked_by'])
+        self.assertIn('work not merged into the base and no merged or closed PR', rows['busy']['blocked_by'])
+        (self.root / 'scratch.txt').unlink()
+        rows = mail.worktrees(self.primary, 'origin/main', pr_state=lambda branch: 'MERGED' if branch == 'busy-task' else None)
+        self.assertTrue(all(r['released'] for r in rows), rows)
+        message = event(worktree=str(busy), reused_from='windows-session busy-task #6')
+        self.assertEqual('windows-session busy-task #6', message['task']['reused_from'])
+        bad = json.loads(json.dumps(message))
+        bad['task']['worktree'] = 'x\nfake line'
+        with self.assertRaises(ValueError):
+            mail.validate(bad, REPO)
+
+    def test_short_rereview_only_for_clean_base_merges(self):
+        approved = self.commit(self.root, 'feature.txt', 'feature\n')
+        self.advance_main('other.txt')
+        run(self.root, 'merge', '-q', '--no-edit', 'origin/main')
+        merged = run(self.root, 'rev-parse', 'HEAD')
+        self.assertEqual([], mail.rereview_check(self.root, approved, merged, 'origin/main')['reasons'])
+        extra = self.commit(self.root, 'feature.txt', 'feature changed\n')
+        result = mail.rereview_check(self.root, approved, extra, 'origin/main')
+        self.assertFalse(result['short_rereview_ok'])
+        self.assertTrue(any('not a merge commit' in r for r in result['reasons']))
+
+    def test_hand_resolved_conflict_needs_a_full_review(self):
+        approved = self.commit(self.root, 'notes.txt', 'task version\n')
+        self.advance_main('notes.txt')
+        subprocess.run(['git', 'merge', '--no-edit', 'origin/main'], cwd=self.root, capture_output=True)
+        (self.root / 'notes.txt').write_text('hand resolved\n', encoding='utf-8')
+        run(self.root, 'add', 'notes.txt')
+        run(self.root, 'commit', '-qm', 'resolve')
+        result = mail.rereview_check(self.root, approved, run(self.root, 'rev-parse', 'HEAD'), 'origin/main')
+        self.assertFalse(result['short_rereview_ok'])
+        self.assertTrue(any('remerge diff' in r for r in result['reasons']), result)
+
+    def test_config_policy_fields(self):
+        config = mail.load_config(self.transport, self.transport.fetch())
+        self.assertIn('game feel', config['merge_policy']['needs_human'])
+        self.assertEqual(4, config['worktree_pool']['max'])
+        with self.assertRaises(ValueError):
+            mail.validate_config({**config, 'worktree_pool': {'max': 0}})
+        with self.assertRaises(ValueError):
+            mail.validate_config({**config, 'merge_policy': {'low_risk': 'docs'}})
+
+
 if __name__ == '__main__':
     unittest.main()

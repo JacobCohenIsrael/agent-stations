@@ -39,6 +39,12 @@ ADMISSION_EVENTS = {'started', 'resumed', 'review_requested'}
 PHASE_FIELDS = {'ready_for_cr': ('pr_url',), 'cr_result': ('verdict',)}
 VERDICTS = {'approved', 'changes_required', 'blocked'}
 DEFAULT_NOTIFY = ['finished', 'paused']
+DEFAULT_POOL = 4
+DEFAULT_MERGE_POLICY = {
+    'low_risk': ['test fixes', 'CI or tooling fixes', 'copy or text tweaks', 'small cosmetic tweaks', 'docs'],
+    'needs_human': ['gameplay tuning', 'controls', 'game feel', 'look', 'sound', 'UX flow', 'narrative',
+                    'new dependencies', 'save-format changes', 'releases'],
+}
 
 SLUG = re.compile(r'[a-z0-9]+(?:-[a-z0-9]+)*\Z')
 SAFE_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z')
@@ -194,6 +200,14 @@ def validate_config(config):
             and archive.get('after_days', 30) >= 1, 'archive.after_days must be a positive integer')
     require(isinstance(config.get('require_linked_worktree', True), bool), 'require_linked_worktree must be boolean')
     require(isinstance(config.get('changes', []), list), 'changes must be a list')
+    pool = config.get('worktree_pool', {})
+    require(isinstance(pool, dict) and type(pool.get('max', DEFAULT_POOL)) is int and pool.get('max', DEFAULT_POOL) >= 1,
+            'worktree_pool.max must be a positive integer')
+    policy = config.get('merge_policy', {})
+    require(isinstance(policy, dict), 'merge_policy must be an object')
+    for key in ('low_risk', 'needs_human'):
+        require(isinstance(policy.get(key, []), list) and all(isinstance(x, str) for x in policy.get(key, [])),
+                f'merge_policy.{key} must be a list of strings')
     return config
 
 
@@ -272,6 +286,10 @@ def validate(message, repo, messages_dir=MESSAGES):
     for field in ('recipient_station',):
         require(task.get(field) is None or (isinstance(task[field], str) and SLUG.fullmatch(task[field])),
                 f'task.{field} must be a lowercase slug')
+    for field in ('worktree', 'reused_from'):
+        value = task.get(field)
+        require(value is None or (isinstance(value, str) and 0 < len(value) <= 300
+                                  and all(c.isprintable() for c in value)), f'task.{field} must be printable text')
     recipient = task.get('recipient_actor')
     require(recipient is None or (isinstance(recipient, str) and re.fullmatch(r'[a-z0-9-]{1,39}/[a-z0-9-]{1,64}', recipient)),
             'task.recipient_actor must be login/agent')
@@ -291,7 +309,8 @@ def validate(message, repo, messages_dir=MESSAGES):
 
 def build_event(*, repo, issue, event, branch, base, head, text, person, login, agent, session, station,
                 to_agent='all', message_id=None, phase=None, verdict=None, pr_url=None, review_head=None,
-                recipient_actor=None, recipient_station=None, intake_returned=False, now=None):
+                recipient_actor=None, recipient_station=None, intake_returned=False, worktree=None,
+                reused_from=None, now=None):
     """One lifecycle event as a validated envelope; phase rules are enforced here."""
     require(event in EVENTS, 'Unknown task event')
     require(phase is None or SLUG.fullmatch(phase.replace('_', '-')) is not None, 'Unsafe task.phase')
@@ -309,6 +328,9 @@ def build_event(*, repo, issue, event, branch, base, head, text, person, login, 
             'branch': branch, 'base': base, 'head': head}
     for field, value in (('phase', phase), ('verdict', verdict), ('pr_url', pr_url), ('review_head', review_head),
                          ('recipient_actor', recipient_actor), ('recipient_station', recipient_station)):
+        if value:
+            task[field] = value
+    for field, value in (('worktree', worktree), ('reused_from', reused_from)):
         if value:
             task[field] = value
     if intake_returned:
@@ -703,7 +725,8 @@ def init(transport, repo=None, base_branch='main', stations=('main',)):
         'require_linked_worktree': True,
         'stations': {name: {'description': ''} for name in stations},
         'review_routing': [], 'watch': {'always_from': [], 'notify_events': DEFAULT_NOTIFY},
-        'archive': {'after_days': 30}, 'also_watch': [], 'changes': []})
+        'archive': {'after_days': 30}, 'worktree_pool': {'max': DEFAULT_POOL},
+        'merge_policy': DEFAULT_MERGE_POLICY, 'also_watch': [], 'changes': []})
     with tempfile.TemporaryDirectory(prefix='station-mail-init-') as temporary:
         env = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
         for path, content in ((CONFIG_FILE, config_bytes(config)),
@@ -782,6 +805,100 @@ def doctor(transport):
     return checks
 
 
+# ----------------------------------------------------------- worktrees / re-review
+
+
+def worktrees(root, base_ref, pr_state=None):
+    """Linked worktrees with what git can tell about reuse, released ones first, most recently used first.
+
+    Agents still confirm the owning session is finished and no editor or process has the folder open.
+    """
+    blocks = git(root, 'worktree', 'list', '--porcelain').stdout.strip().split('\n\n')
+    rows = []
+    for block in blocks[1:]:  # the first entry is the primary checkout, never pooled
+        fields = {}
+        for line in block.splitlines():
+            key, _, value = line.partition(' ')
+            fields[key] = value or True
+        path = Path(fields['worktree'])
+        branch = fields['branch'][len('refs/heads/'):] if isinstance(fields.get('branch'), str) else None
+        row = {'path': str(path), 'branch': branch, 'head': fields.get('HEAD'), 'locked': 'locked' in fields,
+               'last_used': 0}
+        reasons = []
+        if not path.is_dir():
+            reasons.append('folder missing (git worktree prune)')
+        else:
+            status = git(path, 'status', '--porcelain', '--untracked-files=normal', check=False).stdout.strip()
+            if status:
+                reasons.append('uncommitted or untracked work')
+            try:
+                gitdir = Path(git(path, 'rev-parse', '--absolute-git-dir').stdout.strip())
+                row['last_used'] = max((gitdir / name).stat().st_mtime for name in ('HEAD', 'index')
+                                       if (gitdir / name).exists())
+            except (RuntimeError, ValueError, OSError):
+                pass
+        if row['locked']:
+            reasons.append('locked')
+        merged = isinstance(row['head'], str) and git(root, 'merge-base', '--is-ancestor', row['head'], base_ref,
+                                                      check=False).returncode == 0
+        row['pr_state'] = pr_state(branch) if (pr_state and branch) else None
+        if not (merged or row['pr_state'] in ('MERGED', 'CLOSED')):
+            reasons.append('work not merged into the base and no merged or closed PR')
+        row['released'] = not reasons
+        row['blocked_by'] = reasons
+        rows.append(row)
+    rows.sort(key=lambda r: (not r['released'], -r['last_used']))
+    return rows
+
+
+def gh_pr_state(repo):
+    if not shutil.which('gh'):
+        return None
+
+    def state(branch):
+        result = subprocess.run(['gh', 'pr', 'list', '--repo', repo, '--head', branch, '--state', 'all',
+                                 '--json', 'state', '-q', '.[0].state'], capture_output=True)
+        return (result.stdout.decode().strip() or None) if result.returncode == 0 else None
+    return state
+
+
+def patch_id(root, base, head):
+    diff = git_bytes(root, 'diff', '--binary', base, head)
+    if not diff.strip():
+        return ''
+    result = subprocess.run(['git', 'patch-id', '--stable'], cwd=root, input=diff, capture_output=True)
+    return result.stdout.decode().split(' ', 1)[0]
+
+
+def rereview_check(root, approved_head, head, base_ref):
+    """Whether `head` differs from an approved head only by clean merges of the base branch.
+
+    Holds when every commit in approved..head merges the base, each remerge diff is empty (no conflict
+    resolved by hand), and the task's own delta against the base is unchanged.
+    """
+    reasons = []
+    if git(root, 'merge-base', '--is-ancestor', approved_head, head, check=False).returncode:
+        reasons.append('the approved head is not an ancestor of the new head')
+    commits = git(root, 'rev-list', '--first-parent', f'{approved_head}..{head}').stdout.split()  # the task's own line
+    for commit in commits:
+        parents = git(root, 'rev-list', '--parents', '-n', '1', commit).stdout.split()[1:]
+        if len(parents) < 2:
+            reasons.append(f'{commit[:9]} is not a merge commit')
+            continue
+        if not any(git(root, 'merge-base', '--is-ancestor', parent, base_ref, check=False).returncode == 0
+                   for parent in parents[1:]):
+            reasons.append(f'{commit[:9]} does not merge the base branch')
+        remerge = git(root, 'show', '--remerge-diff', '--format=', commit, check=False)
+        if remerge.returncode or remerge.stdout.strip():
+            reasons.append(f'{commit[:9]} has a non-empty remerge diff (conflicts resolved by hand)')
+    old = patch_id(root, git(root, 'merge-base', approved_head, base_ref).stdout.strip(), approved_head)
+    new = patch_id(root, git(root, 'merge-base', head, base_ref).stdout.strip(), head)
+    if old != new:
+        reasons.append('the task delta against the base changed since the approval')
+    return {'approved_head': approved_head, 'head': head, 'merges': len(commits), 'short_rereview_ok': not reasons,
+            'reasons': reasons}
+
+
 # --------------------------------------------------------------------------- cli
 
 
@@ -856,6 +973,8 @@ def main(argv=None):
     p.add_argument('--recipient-actor')
     p.add_argument('--recipient-station')
     p.add_argument('--intake-returned', action='store_true')
+    p.add_argument('--worktree', help='absolute path of the linked worktree this session works in')
+    p.add_argument('--reused-from', help='prior owner of a reused worktree: session, branch, issue')
     p.add_argument('--to', default='all')
     p.add_argument('--id')
     p.add_argument('--station', help='default: git config stations.station')
@@ -898,6 +1017,12 @@ def main(argv=None):
 
     commands.add_parser('doctor', help='check this machine and repository setup')
 
+    commands.add_parser('worktrees', help='list linked worktrees for reuse: released first, most recently used first')
+
+    p = commands.add_parser('rereview-check', help='can a head that only merged the base reuse an approval?')
+    p.add_argument('--approved-head', required=True)
+    p.add_argument('--head', required=True)
+
     args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         # Pipes on Windows default to the ANSI code page; message text may hold any Unicode.
@@ -931,7 +1056,8 @@ def main(argv=None):
                 session=args.session, station=args.station or transport.setting('station'), to_agent=args.to,
                 message_id=args.id, phase=args.phase, verdict=args.verdict, pr_url=args.pr_url,
                 review_head=args.review_head, recipient_actor=args.recipient_actor,
-                recipient_station=args.recipient_station, intake_returned=args.intake_returned)
+                recipient_station=args.recipient_station, intake_returned=args.intake_returned,
+                worktree=args.worktree, reused_from=args.reused_from)
             result = message if args.dry_run else send(transport, message, cwd)
         elif args.command == 'send':
             result = send(transport, json.loads(args.message_file.read_text(encoding='utf-8-sig')), cwd)
@@ -961,6 +1087,17 @@ def main(argv=None):
                 else:
                     result = set_paused(transport, args.action == 'pause', getattr(args, 'reason', ''),
                                         actor_label(args), station, args.quote)
+        elif args.command in ('worktrees', 'rereview-check'):
+            transport.fetch()
+            config = load_config(transport)
+            git(cwd, 'fetch', '--quiet', transport.remote, config['base_branch'], check=False)
+            base_ref = f"{transport.remote}/{config['base_branch']}"
+            if args.command == 'worktrees':
+                rows = worktrees(cwd, base_ref, gh_pr_state(config['repo']))
+                pool = config.get('worktree_pool', {}).get('max', DEFAULT_POOL)
+                result = {'pool_max': pool, 'over_pool_by': max(0, len(rows) - pool), 'worktrees': rows}
+            else:
+                result = rereview_check(cwd, args.approved_head, args.head, base_ref)
         elif args.command == 'review-reminder':
             text = review_reminder(transport, args.branch_name, args.head)
             if text:

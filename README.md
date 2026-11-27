@@ -23,7 +23,8 @@ python .agents/skills/station-mail/scripts/station_mail.py doctor
 
 ## Guardrails built in
 
-- Merges need the human's own OK, given to the merging session; relayed OKs don't count.
+- Every merge needs an approved review at the exact head plus green checks. Low-risk changes (tests, tooling, docs, copy, small cosmetics) merge on that alone. Changes judged by feel, and other risky ones, also need the human's OK. That OK may be given in advance and relayed between stations, but only quoted word for word with where it was said.
+- Worktrees come from a reuse pool; a new one is made only when none is released.
 - No self-approval: every review is a separate session's own verdict, pinned to the exact PR head.
 - No credentials in mail or config.
 - Mail and config can't grant permission; only the human can.

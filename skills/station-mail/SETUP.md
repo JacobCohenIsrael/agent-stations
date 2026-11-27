@@ -45,6 +45,12 @@ Per-machine watcher state (the last-seen commit for each watched branch) lives i
   "watch": {"always_from": ["*/codex@*"], "notify_events": ["finished", "paused"]},
   "usage_stop": {"claude": {"weekly_remaining_percent": 5, "five_hour_remaining_percent": 10}},
   "archive": {"after_days": 30},
+  "worktree_pool": {"max": 4},
+  "merge_policy": {
+    "low_risk": ["test fixes", "CI or tooling fixes", "copy or text tweaks", "small cosmetic tweaks", "docs"],
+    "needs_human": ["gameplay tuning", "controls", "game feel", "look", "sound", "UX flow", "narrative",
+                    "new dependencies", "save-format changes", "releases"]
+  },
   "also_watch": [],
   "changes": []
 }
@@ -52,6 +58,8 @@ Per-machine watcher state (the last-seen commit for each watched branch) lives i
 
 - `review_routing`: each rule matches the sender `login/agent@station` (shell-style `*` wildcards) and names the station whose coordinator reviews that sender's PRs. The first match wins. A sender that matches no rule gets no automatic reviewer, so end the list with a catch-all `"*"` if every PR should be routed.
 - `watch.always_from`: senders whose every message wakes this coordinator. `notify_events`: events from other stations that wake it, `finished` and `paused` by default.
+- `worktree_pool.max`: how many linked worktrees a station keeps for reuse (see the station-coordinator skill).
+- `merge_policy`: which kinds of change merge on an approved review alone (`low_risk`), and which also need the human's OK (`needs_human`). Edit the lists to fit the project; when a change fits neither, ask the human.
 - `usage_stop`: provider allowance floors that sessions honour before starting work. The tool stores them; agents read them.
 - `also_watch`: extra `{"branch", "messages_dir"}` mailboxes that `watch` and `inbox` read, for migrating from an older mail branch. Old messages have no station, so their sender key ends in `@?`. During the transition, add routing rules such as `{"from": "jacobcohenisrael/claude@?", "reviewer": "windows"}`. Legacy mail about a branch checked out on this machine always counts as this station's own.
 - `changes`: an append-only record of each config change (`at`, `by`, `quote`), written by `config apply`, `config pause` and `config resume`.

@@ -22,7 +22,7 @@ Handle every line the watcher printed, then restart the watcher. A wake is done 
 
 - **`review needed: <PR> ...`**: `stations.json` routes this sender's PRs to this station.
   1. Check natively that the PR is open and its head equals the head in the line. Skip it if that head already has a `cr_started` or `cr_result` from anyone, or a review comment.
-  2. Start a fresh, independent reviewer (a subagent or a new session, isolated in its own worktree where the client allows). Brief it with the issue, PR URL, exact head, the author's station and the project's review instructions.
+  2. Pick its worktree (see Worktree pool), then start a fresh, independent reviewer there: a subagent or a new session. Brief it with the issue, PR URL, exact head, the author's station, the project's review instructions, and the short re-review path for base-merge-only heads (station-mail Merging).
   3. The reviewer sends `cr_started` (possible only from a linked worktree; a reviewer that had to run in the primary checkout skips it), reviews the exact head against the issue and the project's standards, posts the review as a PR comment, and sends `cr_result` with `--recipient-station <author station>`.
   4. Relay the verdict to the human in one line: PR, verdict, head.
 - **`cr_result ... for this station`**: route the verdict to the executor session that owns that branch, quoting the reviewer's message ID. The executor acts on the reviewer's own record, never on the relay.
@@ -37,10 +37,26 @@ While the slot is free, and only on a wake or the human's request:
 
 1. Check the station's usage allowance against `usage_stop` in `stations.json`. At or below a floor, or with no reliable reading, start nothing and say so.
 2. Pick one eligible native GitHub issue: the human's choice, or the next unblocked one under the project's own priority rules.
-3. Start a fresh executor session for it, at a stronger model and effort where the client allows, with a short brief: issue, branch base, project instructions to read, and the reminder that it owns re-routing its own review request if nobody sends `cr_started` within about an hour.
-4. Record the executor's session, then take no new task until its `finished` returns intake.
+3. Pick its worktree (see Worktree pool), then start a fresh executor session there, at a stronger model and effort where the client allows. Keep the brief short: issue, branch base, worktree and prior owner, project instructions to read, and a reminder that the executor owns re-routing its own review request if nobody sends `cr_started` within about an hour.
+4. Record the executor's session and worktree, then take no new task until its `finished` returns intake.
 
 Reviews and routing continue while intake is held: routing an event is not a new task.
+
+## Worktree pool
+
+Reusing a released worktree is a MUST: each new worktree costs disk space, a fresh dependency or editor import, and clutter.
+
+1. Run `station_mail.py worktrees`. It lists the linked worktrees, released ones first and most recently used first, with the reason any of them is blocked.
+2. A worktree is **released** when all of these hold:
+   - its session is finished;
+   - its PR is merged or closed, or its work is already in the base branch;
+   - it has no uncommitted or untracked work;
+   - no editor or process has it open.
+
+   The tool checks the git conditions; you confirm the session and process ones.
+3. Take the first released worktree. The new session starts in that folder and creates a fresh branch from the current base (`git switch -c <branch> <remote>/<base>`). Never switch a checkout that an active writer is using.
+4. Create a new worktree only when none is released, or when tasks run at the same time. Keep the pool near `worktree_pool.max` in `stations.json` (default 4). `over_pool_by` in the output says how many extras exist; remove them only with the human's OK.
+5. The session records the worktree and its prior owner in its first event (`--worktree`, `--reused-from`) and in the task record.
 
 ## Archive (monthly)
 
@@ -57,7 +73,7 @@ station_mail.py archive
 
 The station-mail guardrails apply in full. For the coordinator in particular:
 
-- **No merging, and no relaying a merge OK.** Only the human's own OK, typed to the executor that merges, authorizes a merge.
+- **The coordinator never merges.** Executors merge under station-mail's Merging rules. When the coordinator relays a merge OK, it quotes the human's exact words and says where they were given, and never widens them.
 - **No reviewing its own station's work in its own context.** Every review is a fresh session, and never by the PR's author session.
 - **No widening scope.** Starting reviews and routing results was authorized when this role was set up. New implementation still needs the human's choice of task, or a priority rule the human set.
 - **No config edits without the human's own words.** Routing and pause changes go through `config apply` / `config pause` with `--quote`.
