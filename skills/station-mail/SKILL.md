@@ -18,9 +18,10 @@ STATION_MAIL_PERSON=Jacob            # the human this agent works for
 STATION_MAIL_LOGIN=JacobCohenIsrael  # that human's GitHub login
 STATION_MAIL_AGENT=claude            # agent slug (lowercase, digits, - or _): claude, codex, windows_codex
 STATION_MAIL_SESSION=<unique id>     # distinguishes parallel or replacement sessions
+STATION_MAIL_STATION=<station>       # optional: only when stations share one clone (see SETUP.md)
 ```
 
-Take the person and login from trusted session context or the human's own words. A shared Git account or a provider name never establishes who is operating an agent; if identity is missing, ask for it. The machine's station comes from `git config stations.station` (set once with `join`).
+Take the person and login from trusted session context or the human's own words. A shared Git account or a provider name never establishes who is operating an agent; if identity is missing, ask for it. The station comes from `$STATION_MAIL_STATION`, else `git config stations.station` (set once with `join`; `join --worktree` when stations share a clone).
 
 ## Lifecycle events
 
@@ -34,10 +35,11 @@ Send one event per meaningful change, in this order for a task:
 | Reviewer verdict | `--event handoff --phase cr_result --verdict approved\|changes_required\|blocked --branch-name <pr branch> --head <pr head> --recipient-station <author station>` |
 | Executor resumes after review or a base merge | `--event resumed --phase repair\|integration`, then a fresh `review_requested` for the new head |
 | Waiting on a human decision, or blocked | `--event paused --phase human_review\|blocked\|usage` |
+| Check another station's watcher is alive | `--event handoff --phase ping --recipient-station <station>`; its watcher sends a `pong` back by itself, and the pong wakes you |
 | Ownership moves to another actor | `--event handoff --phase ownership --recipient-actor <login/agent> --recipient-station <station>`; the receiver sends `resumed` once it accepts |
 | Task delivered | `--event finished --intake-returned` (only when the whole task is delivered) |
 
-Each event pins the exact `head`; a review is valid only for the head it names, so any push after `review_requested` needs `resumed` plus a fresh `review_requested`. `review-reminder` prints that reminder from a pre-push hook. Put outcome, checks and references in `--text`, and keep the full record in the GitHub issue. Message fields and phases are in [ENVELOPE.md](ENVELOPE.md).
+For a PR in another repository, pass that repository's `--head`, `--base` and `--branch-name` (the tool refuses without them rather than record this checkout's commits). Each event pins the exact `head`; a review is valid only for the head it names, so any push after `review_requested` needs `resumed` plus a fresh `review_requested`. `review-reminder` prints that reminder from a pre-push hook. Put outcome, checks and references in `--text`, and keep the full record in the GitHub issue. Message fields and phases are in [ENVELOPE.md](ENVELOPE.md).
 
 `started`, `resumed` and `review_requested` are **admission events**: they are refused while stations are paused (`stations.json` `paused: true`) and from a primary checkout. `paused`, `handoff` and `finished` always go through, so work can stop cleanly.
 

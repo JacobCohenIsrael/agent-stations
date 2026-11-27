@@ -57,6 +57,8 @@ Valid events: `started`, `resumed`, `paused`, `handoff`, `review_requested`, `fi
 | `repair`, `integration`, `manual_test` | `resumed` | cite the review or merge the resumption answers |
 | `human_review`, `blocked`, `usage` | `paused` | the human or action needed, the exact state |
 | `ownership` | `handoff` | `recipient_actor`, `recipient_station`; the receiver sends `resumed` once it accepts |
+| `ping` | `handoff` | `recipient_station`; a liveness check that the addressed station's watcher answers by itself |
+| `pong` | `handoff` | `recipient_station` of the pinger; sent by the watcher with fixed text, never answered |
 
 `finished` may carry `intake_returned: true` (`--intake-returned`), meaning the whole task is delivered and the coordinator may take a new one. A reviewer's work ends with a `cr_result` handoff, never `finished`: reviewing doesn't deliver the task.
 

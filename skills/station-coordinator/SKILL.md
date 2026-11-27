@@ -18,7 +18,7 @@ It depends on the **station-mail** skill for identity, events and guardrails. It
 
 ## On each wake
 
-Handle every line the watcher printed, then restart the watcher. A wake is done when each line has been routed, or recorded as needing the human.
+Handle every line the watcher printed, then restart the watcher. The watcher answers a `ping` addressed to this station with a `pong` by itself, using the session's `STATION_MAIL_*` identity; a ping it could not answer shows up as a `ping from … reply needed` line: send the pong with `event --event handoff --phase pong --recipient-station <pinger>`. A `pong` line is the answer to your own ping; no reply. Answering pings is the only mail the watcher sends itself. A ping on an `also_watch` branch isn't answered automatically and shows as a plain `ping for this station` line: answer it the same way. A wake is done when each line has been routed, or recorded as needing the human.
 
 - **`review needed: <PR> ...`**: `stations.json` routes this sender's PRs to this station.
   1. Check natively that the PR is open and its head equals the head in the line. Skip it if that head already has a `cr_started` or `cr_result` from anyone, or a review comment.

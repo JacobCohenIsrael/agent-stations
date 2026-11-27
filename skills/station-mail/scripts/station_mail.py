@@ -139,7 +139,24 @@ class Transport:
         common = Path(git(self.root, 'rev-parse', '--git-common-dir').stdout.strip())
         return common if common.is_absolute() else (self.root / common)
 
-    def state_path(self):
+    def station(self):
+        """This session's station: $STATION_MAIL_STATION, else git config (a worktree's own value wins)."""
+        station = os.environ.get('STATION_MAIL_STATION') or self.setting('station')
+        require(station is None or SLUG.fullmatch(station) is not None,
+                f'station {station!r} must be a lowercase slug (letters, digits, - or _)')
+        return station
+
+    def station_source(self):
+        if os.environ.get('STATION_MAIL_STATION'):
+            return 'STATION_MAIL_STATION'
+        found = git(self.root, 'config', '--show-scope', '--get', 'stations.station', check=False)
+        return found.stdout.split('\t', 1)[0].strip() or None
+
+    def state_path(self, station):
+        """One read cursor per station, so stations sharing a clone never consume each other's mail."""
+        return self.common_dir().resolve() / 'agent-stations' / f'state-{station}.json'
+
+    def legacy_state_path(self):
         return self.common_dir().resolve() / 'agent-stations' / 'state.json'
 
     def build_commit(self, tip, changes, subject):
@@ -285,6 +302,9 @@ REVIEW_PHASES = {  # phase: (event, fields every newly written message of that p
     'ready_for_cr': ('review_requested', ('pr_url', 'review_head')),
     'cr_started': ('started', ('review_head',)),
     'cr_result': ('handoff', ('verdict', 'review_head', 'recipient_station')),
+    # A liveness check: the addressed station's watcher answers a ping with a pong by itself.
+    'ping': ('handoff', ('recipient_station',)),
+    'pong': ('handoff', ('recipient_station',)),
 }
 
 
@@ -382,6 +402,8 @@ def build_event(*, repo, issue, event, branch, base, head, text, person, login, 
     require(recipient_station is None or SLUG.fullmatch(recipient_station), 'recipient station must be a slug')
     if phase == 'cr_result':
         require(recipient_station, 'phase cr_result requires --recipient-station (the author\'s station)')
+    if phase in ('ping', 'pong'):
+        require(event == 'handoff' and recipient_station, f'phase {phase} is a handoff with --recipient-station')
     if phase in ('ready_for_cr', 'cr_result', 'cr_started'):
         review_head = review_head or head
         require(review_head == head, 'review_head must equal head (the exact reviewed head)')
@@ -646,8 +668,20 @@ def infer_station(message, session_stations):
                  if fnmatch.fnmatchcase(session, pattern.lower())), None)
 
 
-def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None, session_stations=None):
-    """Actionable lines for commits in start..end (start None: the last 24 hours)."""
+def is_ping_for(message, me):
+    """A ping a station (not older stationless mail) addressed to this station."""
+    task = message.get('task') or {}
+    actor = message.get('actor') or {}
+    return (task.get('event') == 'handoff' and task.get('phase') == 'ping' and task.get('recipient_station') == me
+            and isinstance(actor.get('station'), str) and SLUG.fullmatch(actor['station']) is not None)
+
+
+def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None, session_stations=None,
+         pings=None):
+    """Actionable lines for commits in start..end (start None: the last 24 hours).
+
+    With a `pings` list, pings addressed here are collected there instead of becoming wake lines.
+    """
     branches = local_branches(transport.root) if branches is None else branches
     if start and git(transport.root, 'merge-base', '--is-ancestor', start, end, check=False).returncode == 0:
         commits = git(transport.root, 'rev-list', '--reverse', f'{start}..{end}').stdout.split()
@@ -663,7 +697,9 @@ def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None
                 message = readable(raw, path, config['repo'], messages_dir)
                 reason = (classify(message, me, config, branches, infer_station(message, session_stations))
                           if message is not None else None)
-                if reason:
+                if reason and pings is not None and messages_dir == MESSAGES and is_ping_for(message, me):
+                    pings.append((commit, message))
+                elif reason:
                     lines.append(f'{commit[:9]} {reason}')
             elif path == CONFIG_FILE and status == 'M':
                 subject = git(transport.root, 'log', '-1', '--format=%s', commit).stdout.strip()
@@ -672,21 +708,43 @@ def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None
     return lines
 
 
-def read_state(transport):
-    try:
-        return json.loads(transport.state_path().read_text(encoding='utf-8'))
-    except (OSError, ValueError):
-        return {}
+LEGACY_MARK = 'migrated_from_legacy'  # set in memory only; write_state consumes it
 
 
-def write_state(transport, state):
-    """Atomic replace, so a second watcher sharing this clone never reads half-written state."""
-    path = transport.state_path()
+def read_state(transport, station):
+    # Before per-station cursors, one state.json served the clone's only station: start from it.
+    for path in (transport.state_path(station), transport.legacy_state_path()):
+        try:
+            state = json.loads(path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(state, dict):
+            return {}
+        if path == transport.legacy_state_path():
+            state[LEGACY_MARK] = True
+        return state
+    return {}
+
+
+def write_state(transport, station, state):
+    """Atomic replace, so a second watcher of this station never reads half-written state."""
+    path = transport.state_path(station)
+    migrated = state.pop(LEGACY_MARK, False)
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary = tempfile.mkstemp(dir=path.parent, prefix='state-', suffix='.tmp')
     with os.fdopen(handle, 'w', encoding='utf-8') as stream:
         stream.write(json.dumps(state, indent=2) + '\n')
     os.replace(temporary, path)
+    if migrated:
+        # The old single cursor belonged to one station. Retire it once, on the write that took it over,
+        # so a station added later gets the usual 24-hour catch-up. A state.json written later by an
+        # older copy of the tool sharing this clone is left alone.
+        try:
+            os.replace(transport.legacy_state_path(), transport.legacy_state_path().with_name('state.json.migrated'))
+        except FileNotFoundError:
+            pass
 
 
 def watch(transport, me, poll=60, once=False, out=sys.stdout):
@@ -697,9 +755,9 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
     """
     config, config_tip = None, None
     while True:
-        state = read_state(transport)
+        state = read_state(transport, me)
         seen = state.setdefault('last_seen', {})
-        found, advanced, unreadable = [], {}, []
+        found, advanced, unreadable, pings = [], {}, [], []
 
         def incomplete(branch, error):
             print(f'warning: could not read {branch}; its cursor stays put for a retry: {error}', file=sys.stderr)
@@ -732,11 +790,15 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
                 if branch != transport.branch and transport.fetch(branch, required=False) is None:
                     raise RuntimeError(f'fetch of {transport.remote}/{branch} at {tip} failed')
                 found += scan(transport, config, me, seen.get(branch), tip, messages_dir,
-                              session_stations=session_stations)
+                              session_stations=session_stations, pings=pings)
             except RuntimeError as error:
                 incomplete(branch, error)
                 continue
             advanced[branch] = tip
+        for commit, ping in pings:
+            problem = answer_ping(transport, config, me, ping)
+            if problem:  # could not answer by itself: hand the ping to the coordinator
+                found.append(f'{commit[:9]} ping from {plain(sender_key(ping["actor"]), 120)}: {plain(problem, 200)}')
         if found:
             print('ACTIONABLE STATION MAIL:', file=out)
             for line in found:
@@ -744,12 +806,41 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
             out.flush()
         if advanced:  # only after the wake lines are out, so a failed print re-reports next time
             seen.update(advanced)
-            write_state(transport, state)
+            write_state(transport, me, state)
         if found:
             return EXIT_ACTIONABLE
         if once:
             return EXIT_INCOMPLETE if unreadable else EXIT_QUIET
         time.sleep(poll)
+
+
+def answer_ping(transport, config, me, ping):
+    """Send the pong for `ping`; None on success, else why it could not be sent.
+
+    The pong's text is fixed and nothing from the ping is followed, so a ping can only ever
+    produce one pong. A retry of the same ping reuses the same id and is idempotent.
+    """
+    names = ('PERSON', 'LOGIN', 'AGENT', 'SESSION')
+    who = {name: os.environ.get('STATION_MAIL_' + name) for name in names}
+    if not all(who.values()):
+        return 'reply needed (an automatic pong needs STATION_MAIL_PERSON, _LOGIN, _AGENT and _SESSION)'
+    task = ping['task']
+    digest = hashlib.sha256(ping['id'].encode('utf-8')).hexdigest()[:12]
+    try:
+        pong = build_event(
+            repo=config['repo'], issue=task['issue'], event='handoff', branch=task['branch'], base=task['base'],
+            head=task['head'], text=f'pong from {me}: watcher running, paused={bool(config.get("paused"))}',
+            person=who['PERSON'], login=who['LOGIN'], agent=who['AGENT'], session=who['SESSION'], station=me,
+            phase='pong', recipient_station=ping['actor']['station'], recipient_actor=ping['actor']['id'],
+            message_id=f"{who['LOGIN'].lower()}-{who['AGENT']}-issue{task['issue']}-pong-{digest}")
+        send(transport, pong)
+    except ValueError as error:
+        if 'Message id collision' in str(error):
+            return None  # another session of this station already answered this ping
+        return f'automatic pong failed: {error}'
+    except RuntimeError as error:
+        return f'automatic pong failed: {error}'
+    return None
 
 
 # ----------------------------------------------------------------------- archive
@@ -949,8 +1040,15 @@ def doctor(transport):
             check('stations.json valid', True, f"repo {config['repo']}, paused={config.get('paused', False)}")
         except (RuntimeError, ValueError) as error:
             check('stations.json valid', False, str(error))
-    me = transport.setting('station')
-    check('this machine has a station (git config stations.station)', me, me or 'run join --station NAME')
+    me = transport.station()
+    source = transport.station_source()
+    check('this session has a station', me, f'{me} (from {source})' if me else 'run join --station NAME')
+    state_dir = transport.common_dir().resolve() / 'agent-stations'
+    others = sorted(path.stem[len('state-'):] for path in state_dir.glob('state-*.json') if path.stem != f'state-{me}')
+    check('no other station reads this clone-wide station', source != 'local' or not others,
+          f'stations {", ".join(others)} also watch from this clone, and every worktree here reads `{me}`: give each '
+          f'agent `join --worktree` or $STATION_MAIL_STATION' if others else 'only this station watches here',
+          required=False)
     if config and me:
         check('station is listed in stations.json', me in config['stations'], ', '.join(config['stations']))
     shapes = {'STATION_MAIL_PERSON': lambda v: identity(v, 'person'),
@@ -1132,8 +1230,10 @@ def main(argv=None):
     p.add_argument('--base-branch', default='main')
     p.add_argument('--stations', default='main', help='comma-separated station names')
 
-    p = commands.add_parser('join', help='record this machine\'s station name (git config, local to this clone)')
+    p = commands.add_parser('join', help='record this station\'s name in git config (this clone, or one worktree)')
     p.add_argument('--station', required=True)
+    p.add_argument('--worktree', action='store_true',
+                   help='set it for this worktree only, when several stations share one clone')
 
     p = commands.add_parser('event', help='build one lifecycle event from flags and send it')
     p.add_argument('--issue', type=int, required=True)
@@ -1213,13 +1313,22 @@ def main(argv=None):
             result = init(transport, args.repo, args.base_branch, stations)
         elif args.command == 'join':
             require(SLUG.fullmatch(args.station) is not None, 'station must be a lowercase slug')
-            git(cwd, 'config', 'stations.station', args.station)
-            result = {'station': args.station}
+            if args.worktree:
+                git(cwd, 'config', 'extensions.worktreeConfig', 'true')
+                git(cwd, 'config', '--worktree', 'stations.station', args.station)
+            else:
+                git(cwd, 'config', 'stations.station', args.station)
+            result = {'station': args.station, 'scope': 'worktree' if args.worktree else 'clone'}
         elif args.command == 'event':
             for flag in ('person', 'login', 'agent', 'session'):
                 require(getattr(args, flag), f'--{flag} (or $STATION_MAIL_{flag.upper()}) is required')
             transport.fetch()
             config = load_config(transport)
+            pr_repo = re.match(r'https://github\.com/([^/]+/[^/]+)/pull/', args.pr_url or '')
+            if pr_repo and pr_repo.group(1).lower() != config['repo'].lower():
+                # This checkout can't see that repository's commits, so its HEAD would be recorded by mistake.
+                require(args.head and args.base and args.branch_name,
+                        f'{args.pr_url} is in another repository: pass --head, --base and --branch-name from it')
             head = args.head or git(cwd, 'rev-parse', 'HEAD').stdout.strip()
             base = args.base
             if not base:
@@ -1230,7 +1339,7 @@ def main(argv=None):
             message = build_event(
                 repo=config['repo'], issue=args.issue, event=args.event, text=args.text, branch=branch,
                 base=base, head=head, person=args.person, login=args.login, agent=args.agent,
-                session=args.session, station=args.station or transport.setting('station'), to_agent=args.to,
+                session=args.session, station=args.station or transport.station(), to_agent=args.to,
                 message_id=args.id, phase=args.phase, verdict=args.verdict, pr_url=args.pr_url,
                 review_head=args.review_head, recipient_actor=args.recipient_actor,
                 recipient_station=args.recipient_station, intake_returned=args.intake_returned,
@@ -1241,8 +1350,8 @@ def main(argv=None):
         elif args.command == 'inbox':
             result = inbox(transport, args.actor, args.issue)
         elif args.command == 'watch':
-            me = transport.setting('station')
-            require(me, 'This machine has no station; run `join --station NAME` first')
+            me = transport.station()
+            require(me, 'This session has no station; run `join --station NAME` or set $STATION_MAIL_STATION')
             if args.range:
                 start, _, end = args.range.partition('..')
                 transport.fetch()
@@ -1257,7 +1366,7 @@ def main(argv=None):
             if args.action == 'show':
                 result = load_config(transport, transport.fetch())
             else:
-                station = transport.setting('station') or '?'
+                station = transport.station() or '?'
                 if args.action == 'apply':
                     new = json.loads(args.file.read_text(encoding='utf-8-sig'))
                     result = apply_config(transport, new, actor_label(args), station, args.quote)
