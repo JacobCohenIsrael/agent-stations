@@ -781,6 +781,19 @@ class VerifiedRoutingReads(Fixture):
                 mail.watch(self.transport, 'windows', once=True, out=io.StringIO())
 
 
+
+class OneCursorPerBranch(Fixture):
+    def test_also_watch_cannot_repeat_a_branch_or_the_mailbox(self):
+        config = mail.load_config(self.transport, self.transport.fetch())
+        twice = [{'branch': 'old-mail', 'messages_dir': 'a'}, {'branch': 'old-mail', 'messages_dir': 'b'}]
+        with self.assertRaises(ValueError):
+            mail.validate_config({**config, 'also_watch': twice})
+        with self.assertRaises(ValueError):
+            mail.apply_config(self.transport, {**config, 'also_watch': [{'branch': 'agent-stations', 'messages_dir': 'x'}]},
+                              'jacob/claude', 'windows', 'Jacob: watch the mailbox again')
+        self.assertEqual([], mail.load_config(self.transport, self.transport.fetch())['also_watch'])
+
+
 class WorktreeReuseAndRereview(Fixture):
     def commit(self, root, name, text):
         (root / name).write_text(text, encoding='utf-8')

@@ -213,6 +213,9 @@ def validate_config(config):
         require(isinstance(extra, dict) and valid_branch(extra.get('branch'))
                 and isinstance(extra.get('messages_dir'), str) and extra['messages_dir'].strip('/')
                 and '..' not in extra['messages_dir'], 'also_watch entries need a branch and a messages_dir')
+    watched = [extra['branch'] for extra in config.get('also_watch', [])]
+    # Each branch has one cursor, so each may be watched once.
+    require(len(watched) == len(set(watched)), 'also_watch lists a branch more than once')
     archive = config.get('archive', {})
     require(isinstance(archive, dict) and type(archive.get('after_days', 30)) is int
             and archive.get('after_days', 30) >= 1, 'archive.after_days must be a positive integer')
@@ -234,7 +237,10 @@ def load_config(transport, revision=None):
     revision = revision or transport.ref()
     if not transport.exists(revision, CONFIG_FILE):
         raise ValueError(f'No {CONFIG_FILE} on {transport.remote}/{transport.branch}; run `init` first')
-    return validate_config(json.loads(transport.show(revision, CONFIG_FILE)))
+    config = validate_config(json.loads(transport.show(revision, CONFIG_FILE)))
+    require(all(extra['branch'] != transport.branch for extra in config.get('also_watch', [])),
+            f'also_watch must not repeat the mailbox branch {transport.branch}')
+    return config
 
 
 def config_bytes(config):
@@ -851,6 +857,8 @@ def change_config(transport, mutate, actor_label, station, quote, now=None):
         updated = mutate(json.loads(json.dumps(current)))
         updated['changes'] = current.get('changes', []) + [{'at': stamp, 'by': f'{actor_label}@{station}', 'quote': quote}]
         validate_config(updated)
+        require(all(extra['branch'] != transport.branch for extra in updated.get('also_watch', [])),
+                f'also_watch must not repeat the mailbox branch {transport.branch}')
         return {CONFIG_FILE: config_bytes(updated)}
 
     commit = transport.append(prepare, f'stations-config({actor_label}@{station}): {quote[:60]}')
