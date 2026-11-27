@@ -599,6 +599,56 @@ class CodexThirdPassRepairs(Fixture):
         self.assertIsNone(mail.readable(mail.payload_bytes(good), 'messages/jacob/claude/copy.json', REPO))
 
 
+
+class IncompletePolls(Fixture):
+    def watched_legacy(self, branch='old-mail'):
+        config = mail.load_config(self.transport, self.transport.fetch())
+        config['also_watch'] = [{'branch': branch, 'messages_dir': 'docs/messages'}]
+        mail.apply_config(self.transport, config, 'jacob/claude', 'windows', 'Jacob: watch ' + branch)
+        mail.watch(self.transport, 'windows', once=True, out=io.StringIO())  # settle the cursor
+
+    def test_absent_optional_branch_is_quiet(self):
+        self.watched_legacy('never-created')
+        self.assertEqual(mail.EXIT_QUIET, mail.watch(self.transport, 'windows', once=True, out=io.StringIO()))
+
+    def test_failed_fetch_of_an_advertised_tip_is_incomplete(self):
+        self.watched_legacy()
+        real_tip, real_fetch = mail.Transport.remote_tip, mail.Transport.fetch
+
+        def tip(transport, branch=None, strict=False):
+            return 'c' * 40 if branch == 'old-mail' else real_tip(transport, branch, strict)
+
+        def fetch(transport, branch=None, required=True):
+            return None if branch == 'old-mail' else real_fetch(transport, branch, required)
+        with unittest.mock.patch.object(mail.Transport, 'remote_tip', tip),                 unittest.mock.patch.object(mail.Transport, 'fetch', fetch):
+            self.assertEqual(mail.EXIT_INCOMPLETE, mail.watch(self.transport, 'windows', once=True, out=io.StringIO()))
+        self.assertNotIn('old-mail', mail.read_state(self.transport)['last_seen'])
+
+    def test_failed_lookup_is_incomplete_but_actionable_mail_still_wakes(self):
+        self.watched_legacy()
+        real = mail.Transport.remote_tip
+
+        def tip(transport, branch=None, strict=False):
+            if branch == 'old-mail':
+                raise RuntimeError('ls-remote failed')
+            return real(transport, branch, strict)
+        with unittest.mock.patch.object(mail.Transport, 'remote_tip', tip):
+            self.assertEqual(mail.EXIT_INCOMPLETE, mail.watch(self.transport, 'windows', once=True, out=io.StringIO()))
+            mail.send(self.transport, event(station='mac', kind='review_requested', phase='ready_for_cr',
+                                            pr_url='https://github.com/example/game/pull/11'))
+            out = io.StringIO()
+            self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(self.transport, 'windows', once=True, out=out))
+        self.assertIn('pull/11', out.getvalue())
+
+    def test_unreachable_remote_is_incomplete(self):
+        def down(transport, branch=None, strict=False):
+            if strict:
+                raise RuntimeError('remote unreachable')
+            return None
+        with unittest.mock.patch.object(mail.Transport, 'remote_tip', down):
+            self.assertEqual(mail.EXIT_INCOMPLETE, mail.watch(self.transport, 'windows', once=True, out=io.StringIO()))
+
+
 class WorktreeReuseAndRereview(Fixture):
     def commit(self, root, name, text):
         (root / name).write_text(text, encoding='utf-8')

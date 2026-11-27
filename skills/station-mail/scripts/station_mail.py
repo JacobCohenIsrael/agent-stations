@@ -115,9 +115,17 @@ class Transport:
             return None
         return git(self.root, 'rev-parse', self.ref(branch)).stdout.strip()
 
-    def remote_tip(self, branch=None):
+    def remote_tip(self, branch=None, strict=False):
+        """The branch's remote tip, or None when the remote has no such branch.
+
+        With `strict`, a failed lookup raises instead of looking like an absent branch.
+        """
         out = git(self.root, 'ls-remote', self.remote, 'refs/heads/' + (branch or self.branch), check=False)
-        return out.stdout.split('\t', 1)[0].strip() if out.returncode == 0 and out.stdout.strip() else None
+        if out.returncode:
+            if strict:
+                raise RuntimeError(f'Cannot look up {self.remote}/{branch or self.branch}: {out.stderr.strip()}')
+            return None
+        return out.stdout.split('\t', 1)[0].strip() or None
 
     def show(self, revision, path):
         return git_bytes(self.root, 'show', f'{revision}:{path}')
@@ -639,23 +647,33 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
     while True:
         state = read_state(transport)
         seen = state.setdefault('last_seen', {})
-        found = []
-        main_tip = transport.remote_tip()
-        if main_tip and main_tip != seen.get(transport.branch):
-            config = load_config(transport, transport.fetch())  # pick up routing changes before classifying
+        found, advanced, unreadable = [], {}, []
+
+        def incomplete(branch, error):
+            print(f'warning: could not read {branch}; its cursor stays put for a retry: {error}', file=sys.stderr)
+            unreadable.append(branch)
+
+        try:
+            main_tip = transport.remote_tip(strict=True)
+            if main_tip and main_tip != seen.get(transport.branch):
+                config = load_config(transport, transport.fetch())  # pick up routing changes before classifying
+        except RuntimeError as error:
+            main_tip = None
+            incomplete(transport.branch, error)
         watched = [(transport.branch, MESSAGES)] + [(e['branch'], e['messages_dir']) for e in config.get('also_watch', [])]
-        advanced, unreadable = {}, []
         for branch, messages_dir in watched:
-            tip = main_tip if branch == transport.branch else transport.remote_tip(branch)
-            if not tip or tip == seen.get(branch):
-                continue
-            if transport.fetch(branch, required=False) is None:
+            if branch in unreadable:
                 continue
             try:
+                # A failed lookup or fetch is an incomplete poll; only a branch the remote truly lacks is quiet.
+                tip = main_tip if branch == transport.branch else transport.remote_tip(branch, strict=True)
+                if not tip or tip == seen.get(branch):
+                    continue
+                if transport.fetch(branch, required=False) is None:
+                    raise RuntimeError(f'fetch of {transport.remote}/{branch} at {tip} failed')
                 found += scan(transport, config, me, seen.get(branch), tip, messages_dir)
             except RuntimeError as error:
-                print(f'warning: could not read {branch}; its cursor stays put for a retry: {error}', file=sys.stderr)
-                unreadable.append(branch)
+                incomplete(branch, error)
                 continue
             advanced[branch] = tip
         if found:
