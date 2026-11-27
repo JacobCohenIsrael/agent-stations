@@ -35,6 +35,7 @@ Send one event per meaningful change, in this order for a task:
 | Reviewer verdict | `--event handoff --phase cr_result --verdict approved\|changes_required\|blocked --branch-name <pr branch> --head <pr head> --recipient-station <author station>` |
 | Executor resumes after review or a base merge | `--event resumed --phase repair\|integration`, then a fresh `review_requested` for the new head |
 | Waiting on a human decision, or blocked | `--event paused --phase human_review\|blocked\|usage` |
+| Check another station's watcher is alive | `--event handoff --phase ping --recipient-station <station>`; its watcher sends a `pong` back by itself, and the pong wakes you |
 | Ownership moves to another actor | `--event handoff --phase ownership --recipient-actor <login/agent> --recipient-station <station>`; the receiver sends `resumed` once it accepts |
 | Task delivered | `--event finished --intake-returned` (only when the whole task is delivered) |
 

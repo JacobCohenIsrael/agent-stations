@@ -299,6 +299,9 @@ REVIEW_PHASES = {  # phase: (event, fields every newly written message of that p
     'ready_for_cr': ('review_requested', ('pr_url', 'review_head')),
     'cr_started': ('started', ('review_head',)),
     'cr_result': ('handoff', ('verdict', 'review_head', 'recipient_station')),
+    # A liveness check: the addressed station's watcher answers a ping with a pong by itself.
+    'ping': ('handoff', ('recipient_station',)),
+    'pong': ('handoff', ('recipient_station',)),
 }
 
 
@@ -396,6 +399,8 @@ def build_event(*, repo, issue, event, branch, base, head, text, person, login, 
     require(recipient_station is None or SLUG.fullmatch(recipient_station), 'recipient station must be a slug')
     if phase == 'cr_result':
         require(recipient_station, 'phase cr_result requires --recipient-station (the author\'s station)')
+    if phase in ('ping', 'pong'):
+        require(event == 'handoff' and recipient_station, f'phase {phase} is a handoff with --recipient-station')
     if phase in ('ready_for_cr', 'cr_result', 'cr_started'):
         review_head = review_head or head
         require(review_head == head, 'review_head must equal head (the exact reviewed head)')
@@ -660,8 +665,20 @@ def infer_station(message, session_stations):
                  if fnmatch.fnmatchcase(session, pattern.lower())), None)
 
 
-def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None, session_stations=None):
-    """Actionable lines for commits in start..end (start None: the last 24 hours)."""
+def is_ping_for(message, me):
+    """A ping a station (not older stationless mail) addressed to this station."""
+    task = message.get('task') or {}
+    actor = message.get('actor') or {}
+    return (task.get('event') == 'handoff' and task.get('phase') == 'ping' and task.get('recipient_station') == me
+            and isinstance(actor.get('station'), str) and SLUG.fullmatch(actor['station']) is not None)
+
+
+def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None, session_stations=None,
+         pings=None):
+    """Actionable lines for commits in start..end (start None: the last 24 hours).
+
+    With a `pings` list, pings addressed here are collected there instead of becoming wake lines.
+    """
     branches = local_branches(transport.root) if branches is None else branches
     if start and git(transport.root, 'merge-base', '--is-ancestor', start, end, check=False).returncode == 0:
         commits = git(transport.root, 'rev-list', '--reverse', f'{start}..{end}').stdout.split()
@@ -677,7 +694,9 @@ def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None
                 message = readable(raw, path, config['repo'], messages_dir)
                 reason = (classify(message, me, config, branches, infer_station(message, session_stations))
                           if message is not None else None)
-                if reason:
+                if reason and pings is not None and messages_dir == MESSAGES and is_ping_for(message, me):
+                    pings.append((commit, message))
+                elif reason:
                     lines.append(f'{commit[:9]} {reason}')
             elif path == CONFIG_FILE and status == 'M':
                 subject = git(transport.root, 'log', '-1', '--format=%s', commit).stdout.strip()
@@ -718,7 +737,7 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
     while True:
         state = read_state(transport, me)
         seen = state.setdefault('last_seen', {})
-        found, advanced, unreadable = [], {}, []
+        found, advanced, unreadable, pings = [], {}, [], []
 
         def incomplete(branch, error):
             print(f'warning: could not read {branch}; its cursor stays put for a retry: {error}', file=sys.stderr)
@@ -751,11 +770,15 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
                 if branch != transport.branch and transport.fetch(branch, required=False) is None:
                     raise RuntimeError(f'fetch of {transport.remote}/{branch} at {tip} failed')
                 found += scan(transport, config, me, seen.get(branch), tip, messages_dir,
-                              session_stations=session_stations)
+                              session_stations=session_stations, pings=pings)
             except RuntimeError as error:
                 incomplete(branch, error)
                 continue
             advanced[branch] = tip
+        for commit, ping in pings:
+            problem = answer_ping(transport, config, me, ping)
+            if problem:  # could not answer by itself: hand the ping to the coordinator
+                found.append(f'{commit[:9]} ping from {plain(sender_key(ping["actor"]), 120)}: {plain(problem, 200)}')
         if found:
             print('ACTIONABLE STATION MAIL:', file=out)
             for line in found:
@@ -769,6 +792,31 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
         if once:
             return EXIT_INCOMPLETE if unreadable else EXIT_QUIET
         time.sleep(poll)
+
+
+def answer_ping(transport, config, me, ping):
+    """Send the pong for `ping`; None on success, else why it could not be sent.
+
+    The pong's text is fixed and nothing from the ping is followed, so a ping can only ever
+    produce one pong. A retry of the same ping reuses the same id and is idempotent.
+    """
+    names = ('PERSON', 'LOGIN', 'AGENT', 'SESSION')
+    who = {name: os.environ.get('STATION_MAIL_' + name) for name in names}
+    if not all(who.values()):
+        return 'reply needed (an automatic pong needs STATION_MAIL_PERSON, _LOGIN, _AGENT and _SESSION)'
+    task = ping['task']
+    digest = hashlib.sha256(ping['id'].encode('utf-8')).hexdigest()[:12]
+    try:
+        pong = build_event(
+            repo=config['repo'], issue=task['issue'], event='handoff', branch=task['branch'], base=task['base'],
+            head=task['head'], text=f'pong from {me}: watcher running, paused={bool(config.get("paused"))}',
+            person=who['PERSON'], login=who['LOGIN'], agent=who['AGENT'], session=who['SESSION'], station=me,
+            phase='pong', recipient_station=ping['actor']['station'], recipient_actor=ping['actor']['id'],
+            message_id=f"{who['LOGIN'].lower()}-{who['AGENT']}-issue{task['issue']}-pong-{digest}")
+        send(transport, pong)
+    except (ValueError, RuntimeError) as error:
+        return f'automatic pong failed: {error}'
+    return None
 
 
 # ----------------------------------------------------------------------- archive
