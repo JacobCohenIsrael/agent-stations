@@ -794,6 +794,74 @@ class OneCursorPerBranch(Fixture):
         self.assertEqual([], mail.load_config(self.transport, self.transport.fetch())['also_watch'])
 
 
+
+class LegacySessionStations(Fixture):
+    hints = {'windows-*': 'windows', 'mac-*': 'mac'}
+
+    def test_session_patterns_tag_older_mail(self):
+        own = event(kind='review_requested', phase='ready_for_cr', pr_url='https://github.com/example/game/pull/1')
+        own['actor']['session_id'] = 'windows-922-agent-stations'
+        del own['actor']['station']
+        tagged = mail.infer_station(own, self.hints)
+        self.assertEqual('windows', tagged['actor']['station'])
+        self.assertNotIn('station', own['actor'], 'the original envelope is untouched')
+        routing = [{'from': '*@mac', 'reviewer': 'windows'}, {'from': '*@?', 'reviewer': 'windows'}]
+        self.assertIsNone(mail.classify(tagged, 'windows', {'review_routing': routing[:1]}, set()))
+        theirs = json.loads(json.dumps(own))
+        theirs['actor']['session_id'] = 'mac-coordinator-review-930'
+        self.assertIn('review needed',
+                      mail.classify(mail.infer_station(theirs, self.hints), 'windows', {'review_routing': routing}, set()))
+        unknown = json.loads(json.dumps(own))
+        unknown['actor']['session_id'] = 'cranky-hodgkin-12'
+        self.assertNotIn('station', mail.infer_station(unknown, self.hints)['actor'])
+
+    def test_watch_applies_the_branch_hints_and_config_checks_them(self):
+        config = mail.load_config(self.transport, self.transport.fetch())
+        with self.assertRaises(ValueError):
+            mail.validate_config({**config, 'also_watch': [{'branch': 'old', 'messages_dir': 'd',
+                                                            'session_stations': {'mac-*': 'linux'}}]})
+        legacy = self.base / 'legacy-hints'
+        run(self.base, 'clone', '-q', str(self.remote), str(legacy))
+        author(legacy)
+        run(legacy, 'checkout', '-q', '--orphan', 'old-mail')
+        run(legacy, 'rm', '-rqf', '.')
+        own = event(kind='review_requested', phase='ready_for_cr', pr_url='https://github.com/example/game/pull/21',
+                    branch='elsewhere/own')
+        own['actor']['session_id'] = 'windows-21'
+        theirs = event(station='mac', kind='review_requested', phase='ready_for_cr', branch='elsewhere/theirs',
+                       pr_url='https://github.com/example/game/pull/22')
+        theirs['actor']['session_id'] = 'mac-22'
+        for message in (own, theirs):
+            del message['actor']['station']
+            target = legacy / 'docs/messages/jacob/claude' / (message['id'] + '.json')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(mail.payload_bytes(message))
+        run(legacy, 'add', '.')
+        run(legacy, 'commit', '-qm', 'legacy')
+        run(legacy, 'push', '-q', 'origin', 'old-mail')
+        config['also_watch'] = [{'branch': 'old-mail', 'messages_dir': 'docs/messages', 'session_stations': self.hints}]
+        config['review_routing'] = [{'from': '*@mac', 'reviewer': 'windows'}, {'from': '*@?', 'reviewer': 'windows'}]
+        mail.apply_config(self.transport, config, 'jacob/claude', 'windows', 'Jacob: legacy hints')
+        out = io.StringIO()
+        self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(self.transport, 'windows', once=True, out=out))
+        self.assertIn('pull/22', out.getvalue())
+        self.assertNotIn('pull/21', out.getvalue(), 'this station\'s own older request stays quiet')
+
+    def test_transient_object_write_failure_is_retried(self):
+        real = mail.Transport.build_commit
+        calls = {'n': 0}
+
+        def flaky(transport, tip, changes, subject):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise RuntimeError('git hash-object failed: Permission denied')
+            return real(transport, tip, changes, subject)
+        with unittest.mock.patch.object(mail.Transport, 'build_commit', flaky), \
+                unittest.mock.patch.object(mail.time, 'sleep'):
+            self.assertFalse(mail.send(self.transport, event(kind='started'))['already_sent'])
+        self.assertEqual(2, calls['n'])
+
+
 class WorktreeReuseAndRereview(Fixture):
     def commit(self, root, name, text):
         (root / name).write_text(text, encoding='utf-8')

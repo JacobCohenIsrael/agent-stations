@@ -140,6 +140,20 @@ class Transport:
     def state_path(self):
         return self.common_dir().resolve() / 'agent-stations' / 'state.json'
 
+    def build_commit(self, tip, changes, subject):
+        """A commit on `tip` applying `changes`, built in a temporary index (the real one is untouched)."""
+        with tempfile.TemporaryDirectory(prefix='station-mail-index-') as temporary:
+            env = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
+            git(self.root, 'read-tree', tip, env=env)
+            for path, content in changes.items():
+                if content is None:
+                    git(self.root, 'update-index', '--force-remove', '--', path, env=env)
+                else:
+                    blob = git(self.root, 'hash-object', '-w', '--stdin', data=content).stdout.strip()
+                    git(self.root, 'update-index', '--add', '--cacheinfo', f'100644,{blob},{path}', env=env)
+            tree = git(self.root, 'write-tree', env=env).stdout.strip()
+        return git(self.root, 'commit-tree', tree, '-p', tip, data=subject + '\n').stdout.strip()
+
     def append(self, prepare, subject, attempts=10):
         """Commit `prepare(tip)` changes ({path: bytes | None}) on the branch tip and push.
 
@@ -151,17 +165,14 @@ class Transport:
             changes = prepare(tip)
             if changes is None:
                 return None
-            with tempfile.TemporaryDirectory(prefix='station-mail-index-') as temporary:
-                env = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
-                git(self.root, 'read-tree', tip, env=env)
-                for path, content in changes.items():
-                    if content is None:
-                        git(self.root, 'update-index', '--force-remove', '--', path, env=env)
-                    else:
-                        blob = git(self.root, 'hash-object', '-w', '--stdin', data=content).stdout.strip()
-                        git(self.root, 'update-index', '--add', '--cacheinfo', f'100644,{blob},{path}', env=env)
-                tree = git(self.root, 'write-tree', env=env).stdout.strip()
-            commit = git(self.root, 'commit-tree', tree, '-p', tip, data=subject + '\n').stdout.strip()
+            try:
+                commit = self.build_commit(tip, changes, subject)
+            except RuntimeError:
+                # Concurrent writers on Windows can briefly lock the object store; retry the attempt.
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(random.uniform(0.1, 0.4) * (attempt + 1))
+                continue
             pushed = git(self.root, 'push', '--quiet', self.remote,
                          f'{commit}:refs/heads/{self.branch}', check=False)
             if pushed.returncode == 0:
@@ -213,6 +224,9 @@ def validate_config(config):
         require(isinstance(extra, dict) and valid_branch(extra.get('branch'))
                 and isinstance(extra.get('messages_dir'), str) and extra['messages_dir'].strip('/')
                 and '..' not in extra['messages_dir'], 'also_watch entries need a branch and a messages_dir')
+        hints = extra.get('session_stations', {})
+        require(isinstance(hints, dict) and all(isinstance(k, str) and k and v in stations for k, v in hints.items()),
+                'also_watch session_stations must map session-id patterns to stations')
     watched = [extra['branch'] for extra in config.get('also_watch', [])]
     # Each branch has one cursor, so each may be watched once.
     require(len(watched) == len(set(watched)), 'also_watch lists a branch more than once')
@@ -605,7 +619,19 @@ def local_branches(root):
     return {line[len('branch refs/heads/'):] for line in listing.splitlines() if line.startswith('branch refs/heads/')}
 
 
-def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None):
+def infer_station(message, session_stations):
+    """Older mail has no actor.station: take it from the first session-id pattern that matches."""
+    actor = message.get('actor')
+    if not session_stations or not isinstance(actor, dict) or actor.get('station'):
+        return message
+    session = str(actor.get('session_id', '')).lower()
+    for pattern, station in session_stations.items():
+        if fnmatch.fnmatchcase(session, pattern.lower()):
+            return dict(message, actor=dict(actor, station=station))
+    return message
+
+
+def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None, session_stations=None):
     """Actionable lines for commits in start..end (start None: the last 24 hours)."""
     branches = local_branches(transport.root) if branches is None else branches
     if start and git(transport.root, 'merge-base', '--is-ancestor', start, end, check=False).returncode == 0:
@@ -620,6 +646,8 @@ def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None
             if status == 'A' and path.startswith(messages_dir + '/') and path.endswith('.json'):
                 raw = transport.show(commit, path)  # a failed read raises, so the cursor stays put
                 message = readable(raw, path, config['repo'], messages_dir)
+                if message is not None:
+                    message = infer_station(message, session_stations)
                 reason = classify(message, me, config, branches) if message is not None else None
                 if reason:
                     lines.append(f'{commit[:9]} {reason}')
@@ -679,9 +707,9 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
             config_tip = None  # force a fresh routing load next poll
         watched = []
         if not unreadable:  # routing verified
-            watched = [(transport.branch, MESSAGES)] + [(e['branch'], e['messages_dir'])
-                                                         for e in config.get('also_watch', [])]
-        for branch, messages_dir in watched:
+            watched = [(transport.branch, MESSAGES, None)] + [(e['branch'], e['messages_dir'], e.get('session_stations'))
+                                                               for e in config.get('also_watch', [])]
+        for branch, messages_dir, session_stations in watched:
             try:
                 # A failed lookup or fetch is an incomplete poll; only a branch the remote truly lacks is quiet.
                 tip = main_tip if branch == transport.branch else transport.remote_tip(branch, strict=True)
@@ -689,7 +717,8 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
                     continue
                 if branch != transport.branch and transport.fetch(branch, required=False) is None:
                     raise RuntimeError(f'fetch of {transport.remote}/{branch} at {tip} failed')
-                found += scan(transport, config, me, seen.get(branch), tip, messages_dir)
+                found += scan(transport, config, me, seen.get(branch), tip, messages_dir,
+                              session_stations=session_stations)
             except RuntimeError as error:
                 incomplete(branch, error)
                 continue
