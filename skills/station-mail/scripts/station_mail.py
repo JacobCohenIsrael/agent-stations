@@ -556,7 +556,9 @@ def inbox(transport, actor=None, issue=None):
 # ------------------------------------------------------------------------- watch
 
 
-TRANSIENT_FETCH = re.compile(r'lock|unpack-objects failed|Permission denied|unable to write', re.I)
+# Local ref-lock and loose-object write races only; an authentication failure ("Permission denied (publickey)")
+# is permanent and reported at once.
+TRANSIENT_FETCH = re.compile(r'\block\b|unpack-objects failed|unable to create temporary file|unable to write', re.I)
 
 
 def sender_key(actor, station=None):
@@ -598,6 +600,9 @@ def classify(message, me, config, local_branches, inferred=None):
     head = task.get('head') if isinstance(task.get('head'), str) and SHA.fullmatch(task['head']) else '?'
     ref = (f"#{plain(task.get('issue'), 12)} {plain(branch or '?', 100)} @ {head} "
            f"from {plain(sender, 120)} ({plain(actor.get('session_id'), 80)})")
+    if event == 'handoff' and task.get('recipient_station') == me:
+        # An explicit recipient decides first, older mail included.
+        return plain(f"{phase or 'handoff'} {task.get('verdict') or ''} for this station: ".replace('  ', ' ')) + ref
     legacy_local = station is None and branch in local_branches
     if legacy_local:
         # Older mail has no station. A verdict about a branch checked out here is for this station's
@@ -611,8 +616,6 @@ def classify(message, me, config, local_branches, inferred=None):
         # Routing decides, even for the sender's own station: the reviewer is a fresh session either way.
         reviewer = next((r for r in (route(config, key) for key in senders) if r), None)
         return f"review needed: {plain(task['pr_url'], 200)} {ref}" if reviewer == me else None
-    if event == 'handoff' and task.get('recipient_station') == me:
-        return plain(f"{phase or 'handoff'} {task.get('verdict') or ''} for this station: ".replace('  ', ' ')) + ref
     if (station or inferred) == me:
         return None
     watch = config.get('watch', {})

@@ -848,6 +848,12 @@ class LegacySessionStations(Fixture):
                       self.verdict('windows', result, {}, {'feature/x'}),
                       "a same-station reviewer's legacy verdict still reaches the branch owner")
         self.assertIsNone(self.verdict('windows', result, {}), 'with no local branch it is quiet')
+        addressed = self.legacy('mac-review-936', kind='handoff', phase='cr_result', verdict='approved',
+                                recipient_station='windows')
+        self.assertIn('cr_result approved for this station', self.verdict('windows', addressed, {}, {'feature/x'}),
+                      'an explicit recipient is honoured before the legacy local-branch rules')
+        self.assertIsNone(self.verdict('mac', addressed, {}, {'feature/x'}),
+                          'and a verdict addressed elsewhere stays quiet on a station with the branch')
 
     def test_malformed_hint_values_are_config_errors(self):
         config = mail.load_config(self.transport, self.transport.fetch())
@@ -881,6 +887,12 @@ class LegacySessionStations(Fixture):
             with self.assertRaises(RuntimeError):
                 self.transport.fetch()
         self.assertEqual(1, calls['n'], 'a permanent failure is reported at once')
+        for permanent in ('git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.',
+                          "fatal: unable to access 'https://example.invalid/': The requested URL returned error: 403"):
+            self.assertIsNone(mail.TRANSIENT_FETCH.search(permanent), permanent)
+        for transient in ("error: cannot lock ref 'refs/remotes/origin/agent-stations': Unable to create '.lock'",
+                          'error: unable to create temporary file: Permission denied\nfatal: unpack-objects failed'):
+            self.assertIsNotNone(mail.TRANSIENT_FETCH.search(transient), transient)
 
     def test_watch_applies_the_branch_hints_and_config_checks_them(self):
         config = mail.load_config(self.transport, self.transport.fetch())
