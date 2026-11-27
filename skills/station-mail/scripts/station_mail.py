@@ -233,7 +233,7 @@ def load_config(transport, revision=None):
     try:
         raw = transport.show(revision, CONFIG_FILE)
     except RuntimeError:
-        raise RuntimeError(f'No {CONFIG_FILE} on {transport.remote}/{transport.branch}; run `init` first') from None
+        raise ValueError(f'No {CONFIG_FILE} on {transport.remote}/{transport.branch}; run `init` first') from None
     return validate_config(json.loads(raw))
 
 
@@ -642,8 +642,12 @@ def write_state(transport, state):
 
 
 def watch(transport, me, poll=60, once=False, out=sys.stdout):
-    """Poll cheaply (ls-remote); print actionable mail and return 0, or 3 after a quiet --once."""
-    config = load_config(transport, transport.fetch())
+    """Poll cheaply (ls-remote); print actionable mail and return 0.
+
+    With --once: 3 when quiet, 4 when a branch could not be read (its cursor is kept for a retry).
+    A missing mailbox or an invalid stations.json is a setup error and raises.
+    """
+    config, config_tip = None, None
     while True:
         state = read_state(transport)
         seen = state.setdefault('last_seen', {})
@@ -653,17 +657,25 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
             print(f'warning: could not read {branch}; its cursor stays put for a retry: {error}', file=sys.stderr)
             unreadable.append(branch)
 
+        # Routing must be current before any cursor moves: classifying with stale routing and then
+        # advancing would silently drop mail that the new routing sends here.
         try:
             main_tip = transport.remote_tip(strict=True)
-            if main_tip and main_tip != seen.get(transport.branch):
-                config = load_config(transport, transport.fetch())  # pick up routing changes before classifying
+            if main_tip is None:
+                raise ValueError(f'No mailbox {transport.remote}/{transport.branch}; run `init` first')
+            if main_tip != config_tip:
+                fetched = transport.fetch()
+                config, config_tip = load_config(transport, fetched), fetched
+                if fetched != main_tip:  # the branch moved between lookup and fetch; scan what was fetched
+                    main_tip = fetched
         except RuntimeError as error:
-            main_tip = None
             incomplete(transport.branch, error)
-        watched = [(transport.branch, MESSAGES)] + [(e['branch'], e['messages_dir']) for e in config.get('also_watch', [])]
+        watched = [(transport.branch, MESSAGES)]
+        if not unreadable:
+            watched += [(e['branch'], e['messages_dir']) for e in config.get('also_watch', [])]
         for branch, messages_dir in watched:
-            if branch in unreadable:
-                continue
+            if transport.branch in unreadable:
+                break
             try:
                 # A failed lookup or fetch is an incomplete poll; only a branch the remote truly lacks is quiet.
                 tip = main_tip if branch == transport.branch else transport.remote_tip(branch, strict=True)

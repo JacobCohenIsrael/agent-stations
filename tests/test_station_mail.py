@@ -649,6 +649,78 @@ class IncompletePolls(Fixture):
             self.assertEqual(mail.EXIT_INCOMPLETE, mail.watch(self.transport, 'windows', once=True, out=io.StringIO()))
 
 
+
+class WatchStartupAndRouting(Fixture):
+    def failing_main_fetch(self, times=1):
+        real = mail.Transport.fetch
+        left = {'n': times}
+
+        def fetch(transport, branch=None, required=True):
+            if (branch or transport.branch) == transport.branch and left['n'] > 0:
+                left['n'] -= 1
+                raise RuntimeError('simulated transport failure')
+            return real(transport, branch, required)
+        return unittest.mock.patch.object(mail.Transport, 'fetch', fetch)
+
+    def test_startup_fetch_failure_is_incomplete_then_recovers(self):
+        mail.watch(self.transport, 'windows', once=True, out=io.StringIO())
+        mail.send(self.transport, event(station='mac', kind='review_requested', phase='ready_for_cr',
+                                        pr_url='https://github.com/example/game/pull/12'))
+        with self.failing_main_fetch():
+            self.assertEqual(mail.EXIT_INCOMPLETE, mail.watch(self.transport, 'windows', once=True, out=io.StringIO()))
+        out = io.StringIO()
+        self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(self.transport, 'windows', once=True, out=out))
+        self.assertIn('pull/12', out.getvalue())
+
+    def test_continuous_watch_retries_a_failed_startup(self):
+        mail.watch(self.transport, 'windows', once=True, out=io.StringIO())
+        mail.send(self.transport, event(station='mac', kind='review_requested', phase='ready_for_cr',
+                                        pr_url='https://github.com/example/game/pull/13'))
+        out = io.StringIO()
+        with self.failing_main_fetch(times=2), unittest.mock.patch.object(mail.time, 'sleep'):
+            self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(self.transport, 'windows', poll=0, out=out))
+        self.assertIn('pull/13', out.getvalue())
+
+    def test_missing_mailbox_is_a_setup_error(self):
+        with unittest.mock.patch.object(mail.Transport, 'remote_tip', lambda transport, branch=None, strict=False: None):
+            with self.assertRaises(ValueError):
+                mail.watch(self.transport, 'windows', once=True, out=io.StringIO())
+
+    def test_failed_routing_refresh_keeps_dependent_cursors(self):
+        legacy = self.base / 'legacy'
+        run(self.base, 'clone', '-q', str(self.remote), str(legacy))
+        author(legacy)
+        run(legacy, 'checkout', '-q', '--orphan', 'old-mail')
+        run(legacy, 'rm', '-rqf', '.')
+        (legacy / 'README').write_text('legacy' + chr(10), encoding='utf-8')
+        run(legacy, 'add', '.')
+        run(legacy, 'commit', '-qm', 'start')
+        run(legacy, 'push', '-q', 'origin', 'old-mail')
+        config = mail.load_config(self.transport, self.transport.fetch())
+        config['also_watch'] = [{'branch': 'old-mail', 'messages_dir': 'docs/messages'}]
+        mail.apply_config(self.transport, config, 'jacob/claude', 'windows', 'Jacob: watch old mail')
+        mail.watch(self.transport, 'windows', once=True, out=io.StringIO())
+        request = event(station='mac', kind='review_requested', phase='ready_for_cr',
+                        pr_url='https://github.com/example/game/pull/14', agent='codex')
+        del request['actor']['station']
+        target = legacy / 'docs/messages/jacob/codex' / (request['id'] + '.json')
+        target.parent.mkdir(parents=True)
+        target.write_bytes(mail.payload_bytes(request))
+        run(legacy, 'add', '.')
+        run(legacy, 'commit', '-qm', 'legacy request')
+        run(legacy, 'push', '-q', 'origin', 'old-mail')
+        config = mail.load_config(self.transport, self.transport.fetch())
+        config['review_routing'].insert(0, {'from': 'jacob/codex@?', 'reviewer': 'windows'})  # new routing
+        mail.apply_config(self.transport, config, 'jacob/claude', 'mac', 'Jacob: Windows reviews old Codex mail')
+        before = dict(mail.read_state(self.transport)['last_seen'])
+        with self.failing_main_fetch():
+            self.assertEqual(mail.EXIT_INCOMPLETE, mail.watch(self.transport, 'windows', once=True, out=io.StringIO()))
+        self.assertEqual(before, mail.read_state(self.transport)['last_seen'], 'no cursor moves on stale routing')
+        out = io.StringIO()
+        self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(self.transport, 'windows', once=True, out=out))
+        self.assertIn('pull/14', out.getvalue())
+
+
 class WorktreeReuseAndRereview(Fixture):
     def commit(self, root, name, text):
         (root / name).write_text(text, encoding='utf-8')
