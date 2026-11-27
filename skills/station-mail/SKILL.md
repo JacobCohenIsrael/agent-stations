@@ -18,9 +18,10 @@ STATION_MAIL_PERSON=Jacob            # the human this agent works for
 STATION_MAIL_LOGIN=JacobCohenIsrael  # that human's GitHub login
 STATION_MAIL_AGENT=claude            # agent slug (lowercase, digits, - or _): claude, codex, windows_codex
 STATION_MAIL_SESSION=<unique id>     # distinguishes parallel or replacement sessions
+STATION_MAIL_STATION=<station>       # optional: only when stations share one clone (see SETUP.md)
 ```
 
-Take the person and login from trusted session context or the human's own words. A shared Git account or a provider name never establishes who is operating an agent; if identity is missing, ask for it. The machine's station comes from `git config stations.station` (set once with `join`).
+Take the person and login from trusted session context or the human's own words. A shared Git account or a provider name never establishes who is operating an agent; if identity is missing, ask for it. The station comes from `$STATION_MAIL_STATION`, else `git config stations.station` (set once with `join`; `join --worktree` when stations share a clone).
 
 ## Lifecycle events
 

@@ -139,7 +139,21 @@ class Transport:
         common = Path(git(self.root, 'rev-parse', '--git-common-dir').stdout.strip())
         return common if common.is_absolute() else (self.root / common)
 
-    def state_path(self):
+    def station(self):
+        """This session's station: $STATION_MAIL_STATION, else git config (a worktree's own value wins)."""
+        return os.environ.get('STATION_MAIL_STATION') or self.setting('station')
+
+    def station_source(self):
+        if os.environ.get('STATION_MAIL_STATION'):
+            return 'STATION_MAIL_STATION'
+        found = git(self.root, 'config', '--show-scope', '--get', 'stations.station', check=False)
+        return found.stdout.split('\t', 1)[0].strip() or None
+
+    def state_path(self, station):
+        """One read cursor per station, so stations sharing a clone never consume each other's mail."""
+        return self.common_dir().resolve() / 'agent-stations' / f'state-{station}.json'
+
+    def legacy_state_path(self):
         return self.common_dir().resolve() / 'agent-stations' / 'state.json'
 
     def build_commit(self, tip, changes, subject):
@@ -672,16 +686,21 @@ def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None
     return lines
 
 
-def read_state(transport):
-    try:
-        return json.loads(transport.state_path().read_text(encoding='utf-8'))
-    except (OSError, ValueError):
-        return {}
+def read_state(transport, station):
+    # Before per-station cursors, one state.json served the clone's only station: start from it.
+    for path in (transport.state_path(station), transport.legacy_state_path()):
+        try:
+            return json.loads(path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            return {}
+    return {}
 
 
-def write_state(transport, state):
-    """Atomic replace, so a second watcher sharing this clone never reads half-written state."""
-    path = transport.state_path()
+def write_state(transport, station, state):
+    """Atomic replace, so a second watcher of this station never reads half-written state."""
+    path = transport.state_path(station)
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary = tempfile.mkstemp(dir=path.parent, prefix='state-', suffix='.tmp')
     with os.fdopen(handle, 'w', encoding='utf-8') as stream:
@@ -697,7 +716,7 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
     """
     config, config_tip = None, None
     while True:
-        state = read_state(transport)
+        state = read_state(transport, me)
         seen = state.setdefault('last_seen', {})
         found, advanced, unreadable = [], {}, []
 
@@ -744,7 +763,7 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
             out.flush()
         if advanced:  # only after the wake lines are out, so a failed print re-reports next time
             seen.update(advanced)
-            write_state(transport, state)
+            write_state(transport, me, state)
         if found:
             return EXIT_ACTIONABLE
         if once:
@@ -949,8 +968,12 @@ def doctor(transport):
             check('stations.json valid', True, f"repo {config['repo']}, paused={config.get('paused', False)}")
         except (RuntimeError, ValueError) as error:
             check('stations.json valid', False, str(error))
-    me = transport.setting('station')
-    check('this machine has a station (git config stations.station)', me, me or 'run join --station NAME')
+    me = transport.station()
+    source = transport.station_source()
+    check('this session has a station', me, f'{me} (from {source})' if me else 'run join --station NAME')
+    check('station is not shared clone-wide', source != 'local',
+          'set in this clone\'s shared config: every worktree and agent here reads it. If another agent shares this '
+          'clone, give each `join --worktree` or $STATION_MAIL_STATION', required=False)
     if config and me:
         check('station is listed in stations.json', me in config['stations'], ', '.join(config['stations']))
     shapes = {'STATION_MAIL_PERSON': lambda v: identity(v, 'person'),
@@ -1132,8 +1155,10 @@ def main(argv=None):
     p.add_argument('--base-branch', default='main')
     p.add_argument('--stations', default='main', help='comma-separated station names')
 
-    p = commands.add_parser('join', help='record this machine\'s station name (git config, local to this clone)')
+    p = commands.add_parser('join', help='record this station\'s name in git config (this clone, or one worktree)')
     p.add_argument('--station', required=True)
+    p.add_argument('--worktree', action='store_true',
+                   help='set it for this worktree only, when several stations share one clone')
 
     p = commands.add_parser('event', help='build one lifecycle event from flags and send it')
     p.add_argument('--issue', type=int, required=True)
@@ -1213,8 +1238,12 @@ def main(argv=None):
             result = init(transport, args.repo, args.base_branch, stations)
         elif args.command == 'join':
             require(SLUG.fullmatch(args.station) is not None, 'station must be a lowercase slug')
-            git(cwd, 'config', 'stations.station', args.station)
-            result = {'station': args.station}
+            if args.worktree:
+                git(cwd, 'config', 'extensions.worktreeConfig', 'true')
+                git(cwd, 'config', '--worktree', 'stations.station', args.station)
+            else:
+                git(cwd, 'config', 'stations.station', args.station)
+            result = {'station': args.station, 'scope': 'worktree' if args.worktree else 'clone'}
         elif args.command == 'event':
             for flag in ('person', 'login', 'agent', 'session'):
                 require(getattr(args, flag), f'--{flag} (or $STATION_MAIL_{flag.upper()}) is required')
@@ -1230,7 +1259,7 @@ def main(argv=None):
             message = build_event(
                 repo=config['repo'], issue=args.issue, event=args.event, text=args.text, branch=branch,
                 base=base, head=head, person=args.person, login=args.login, agent=args.agent,
-                session=args.session, station=args.station or transport.setting('station'), to_agent=args.to,
+                session=args.session, station=args.station or transport.station(), to_agent=args.to,
                 message_id=args.id, phase=args.phase, verdict=args.verdict, pr_url=args.pr_url,
                 review_head=args.review_head, recipient_actor=args.recipient_actor,
                 recipient_station=args.recipient_station, intake_returned=args.intake_returned,
@@ -1241,8 +1270,8 @@ def main(argv=None):
         elif args.command == 'inbox':
             result = inbox(transport, args.actor, args.issue)
         elif args.command == 'watch':
-            me = transport.setting('station')
-            require(me, 'This machine has no station; run `join --station NAME` first')
+            me = transport.station()
+            require(me, 'This session has no station; run `join --station NAME` or set $STATION_MAIL_STATION')
             if args.range:
                 start, _, end = args.range.partition('..')
                 transport.fetch()
@@ -1257,7 +1286,7 @@ def main(argv=None):
             if args.action == 'show':
                 result = load_config(transport, transport.fetch())
             else:
-                station = transport.setting('station') or '?'
+                station = transport.station() or '?'
                 if args.action == 'apply':
                     new = json.loads(args.file.read_text(encoding='utf-8-sig'))
                     result = apply_config(transport, new, actor_label(args), station, args.quote)

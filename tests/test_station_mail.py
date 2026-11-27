@@ -3,6 +3,7 @@ import concurrent.futures
 import datetime
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -224,9 +225,9 @@ class Watch(Fixture):
         self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(mac_transport, 'mac', once=True, out=out))
         self.assertIn('review needed: https://github.com/example/game/pull/3', out.getvalue())
         self.assertEqual(mail.EXIT_QUIET, mail.watch(mac_transport, 'mac', once=True, out=io.StringIO()))
-        state = json.loads(mac_transport.state_path().read_text(encoding='utf-8'))
+        state = json.loads(mac_transport.state_path('mac').read_text(encoding='utf-8'))
         self.assertEqual(mac_transport.remote_tip(), state['last_seen']['agent-stations'])
-        self.assertTrue(str(mac_transport.state_path()).startswith(str((mac_primary / '.git').resolve())))
+        self.assertTrue(str(mac_transport.state_path('mac')).startswith(str((mac_primary / '.git').resolve())))
 
     def test_also_watch_reads_a_legacy_branch(self):
         legacy = self.base / 'legacy'
@@ -622,7 +623,7 @@ class IncompletePolls(Fixture):
             return None if branch == 'old-mail' else real_fetch(transport, branch, required)
         with unittest.mock.patch.object(mail.Transport, 'remote_tip', tip),                 unittest.mock.patch.object(mail.Transport, 'fetch', fetch):
             self.assertEqual(mail.EXIT_INCOMPLETE, mail.watch(self.transport, 'windows', once=True, out=io.StringIO()))
-        self.assertNotIn('old-mail', mail.read_state(self.transport)['last_seen'])
+        self.assertNotIn('old-mail', mail.read_state(self.transport, 'windows')['last_seen'])
 
     def test_failed_lookup_is_incomplete_but_actionable_mail_still_wakes(self):
         self.watched_legacy()
@@ -712,10 +713,10 @@ class WatchStartupAndRouting(Fixture):
         config = mail.load_config(self.transport, self.transport.fetch())
         config['review_routing'].insert(0, {'from': 'jacob/codex@?', 'reviewer': 'windows'})  # new routing
         mail.apply_config(self.transport, config, 'jacob/claude', 'mac', 'Jacob: Windows reviews old Codex mail')
-        before = dict(mail.read_state(self.transport)['last_seen'])
+        before = dict(mail.read_state(self.transport, 'windows')['last_seen'])
         with self.failing_main_fetch():
             self.assertEqual(mail.EXIT_INCOMPLETE, mail.watch(self.transport, 'windows', once=True, out=io.StringIO()))
-        self.assertEqual(before, mail.read_state(self.transport)['last_seen'], 'no cursor moves on stale routing')
+        self.assertEqual(before, mail.read_state(self.transport, 'windows')['last_seen'], 'no cursor moves on stale routing')
         out = io.StringIO()
         self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(self.transport, 'windows', once=True, out=out))
         self.assertIn('pull/14', out.getvalue())
@@ -761,7 +762,7 @@ class VerifiedRoutingReads(Fixture):
         with unittest.mock.patch.object(mail.Transport, 'show', show):
             self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(self.transport, 'windows', once=True, out=out))
         self.assertIn('pull/15', out.getvalue())
-        state = mail.read_state(self.transport)['last_seen']
+        state = mail.read_state(self.transport, 'windows')['last_seen']
         self.assertNotEqual(self.transport.remote_tip(), state.get('agent-stations'), 'failed primary keeps its cursor')
 
     def test_config_read_failure_is_transient_but_absence_is_setup(self):
@@ -794,6 +795,68 @@ class OneCursorPerBranch(Fixture):
         self.assertEqual([], mail.load_config(self.transport, self.transport.fetch())['also_watch'])
 
 
+
+
+class StationsSharingOneClone(Fixture):
+    """Two stations (for example a Claude and a Codex on one PC) working from one clone."""
+
+    def cli(self, cwd, *argv):
+        import contextlib
+        previous = Path.cwd()
+        os.chdir(cwd)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = mail.main(list(argv))
+            return code, out.getvalue()
+        finally:
+            os.chdir(previous)
+
+    def test_join_worktree_scopes_the_station_and_the_environment_wins(self):
+        self.assertEqual('windows', mail.Transport(self.primary).station())
+        self.assertEqual('local', mail.Transport(self.primary).station_source())
+        code, _ = self.cli(self.root, 'join', '--station', 'mac', '--worktree')
+        self.assertEqual(0, code)
+        self.assertEqual('mac', mail.Transport(self.root).station(), 'the worktree reads its own station')
+        self.assertEqual('worktree', mail.Transport(self.root).station_source())
+        self.assertEqual('windows', mail.Transport(self.primary).station(), 'the clone-wide value is unchanged')
+        with unittest.mock.patch.dict(os.environ, {'STATION_MAIL_STATION': 'codex'}):
+            self.assertEqual('codex', mail.Transport(self.root).station())
+            self.assertEqual('STATION_MAIL_STATION', mail.Transport(self.root).station_source())
+            code, out = self.cli(self.root, 'event', '--issue', '7', '--event', 'started', '--text', 'go',
+                                 '--dry-run', '--person', 'Jacob', '--login', 'Jacob', '--agent', 'codex',
+                                 '--session', 's2')
+            self.assertEqual(0, code, out)
+            self.assertEqual('codex', json.loads(out)['actor']['station'])
+
+    def test_each_station_keeps_its_own_cursor(self):
+        mail.send(self.transport, event(station='mac', kind='handoff', phase='ownership', recipient_station='windows',
+                                        recipient_actor='jacob/claude', branch='feature/w'))
+        mail.send(self.transport, event(station='mac', kind='handoff', phase='ownership', recipient_station='mac',
+                                        recipient_actor='jacob/codex', branch='feature/m'))
+        first = io.StringIO()
+        self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(self.transport, 'windows', once=True, out=first))
+        self.assertIn('feature/w', first.getvalue())
+        second = io.StringIO()
+        self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(self.transport, 'mac', once=True, out=second),
+                         "another station's watcher on the same clone does not consume this one's mail")
+        self.assertIn('feature/m', second.getvalue())
+        self.assertNotEqual(self.transport.state_path('windows'), self.transport.state_path('mac'))
+
+    def test_the_single_station_cursor_carries_over(self):
+        legacy = self.transport.legacy_state_path()
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({'last_seen': {'agent-stations': 'a' * 40}}), encoding='utf-8')
+        self.assertEqual('a' * 40, mail.read_state(self.transport, 'windows')['last_seen']['agent-stations'])
+        mail.write_state(self.transport, 'windows', {'last_seen': {'agent-stations': 'b' * 40}})
+        self.assertEqual('b' * 40, mail.read_state(self.transport, 'windows')['last_seen']['agent-stations'])
+
+    def test_doctor_warns_about_a_clone_wide_station(self):
+        code, out = self.cli(self.root, 'doctor')
+        self.assertIn('station is not shared clone-wide', out)
+        self.assertEqual(0, code, 'the warning is advisory')
+        self.cli(self.root, 'join', '--station', 'windows', '--worktree')
+        code, out = self.cli(self.root, 'doctor')
+        self.assertIn('windows (from worktree)', out)
 
 class LegacySessionStations(Fixture):
     hints = {'windows-*': 'windows', 'mac-*': 'mac'}
