@@ -39,7 +39,7 @@ Send one event per meaningful change, in this order for a task:
 | Ownership moves to another actor | `--event handoff --phase ownership --recipient-actor <login/agent> --recipient-station <station>`; the receiver sends `resumed` once it accepts |
 | Task delivered | `--event finished --intake-returned` (only when the whole task is delivered) |
 
-Each event pins the exact `head`; a review is valid only for the head it names, so any push after `review_requested` needs `resumed` plus a fresh `review_requested`. `review-reminder` prints that reminder from a pre-push hook. Put outcome, checks and references in `--text`, and keep the full record in the GitHub issue. Message fields and phases are in [ENVELOPE.md](ENVELOPE.md).
+For a PR in another repository, pass that repository's `--head`, `--base` and `--branch-name` (the tool refuses without them rather than record this checkout's commits). Each event pins the exact `head`; a review is valid only for the head it names, so any push after `review_requested` needs `resumed` plus a fresh `review_requested`. `review-reminder` prints that reminder from a pre-push hook. Put outcome, checks and references in `--text`, and keep the full record in the GitHub issue. Message fields and phases are in [ENVELOPE.md](ENVELOPE.md).
 
 `started`, `resumed` and `review_requested` are **admission events**: they are refused while stations are paused (`stations.json` `paused: true`) and from a primary checkout. `paused`, `handoff` and `finished` always go through, so work can stop cleanly.
 

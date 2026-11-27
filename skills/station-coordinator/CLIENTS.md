@@ -1,6 +1,6 @@
 # Client adapters for the coordinator
 
-The watcher is the same on every client: `station_mail.py watch --poll 60` exits 0 and prints `ACTIONABLE STATION MAIL:` lines when this station must act. A client needs three things: a way to run it in the background, a way to be woken when it exits, and a backstop that restarts it.
+The watcher is the same on every client: `station_mail.py watch --poll 60` exits 0 and prints `ACTIONABLE STATION MAIL:` lines when this station must act. When several stations share one clone, start each watcher with `STATION_MAIL_STATION=<station>`, or from a worktree joined with `join --worktree`; otherwise it watches as the clone's station. A client needs three things: a way to run it in the background, a way to be woken when it exits, and a backstop that restarts it.
 
 ## Claude Code
 

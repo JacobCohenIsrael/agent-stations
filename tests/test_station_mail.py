@@ -849,10 +849,33 @@ class StationsSharingOneClone(Fixture):
         self.assertEqual('a' * 40, mail.read_state(self.transport, 'windows')['last_seen']['agent-stations'])
         mail.write_state(self.transport, 'windows', {'last_seen': {'agent-stations': 'b' * 40}})
         self.assertEqual('b' * 40, mail.read_state(self.transport, 'windows')['last_seen']['agent-stations'])
+        self.assertFalse(legacy.exists(), 'the old single cursor is retired once handed over')
+        self.assertEqual({}, mail.read_state(self.transport, 'mac'), 'a later station starts fresh')
+
+    def test_a_malformed_station_is_refused(self):
+        with unittest.mock.patch.dict(os.environ, {'STATION_MAIL_STATION': 'Windows '}):
+            with self.assertRaises(ValueError):
+                mail.Transport(self.root).station()
+
+    def test_a_pr_in_another_repository_needs_explicit_commits(self):
+        code, out = self.cli(self.root, 'event', '--issue', '7', '--event', 'review_requested', '--phase',
+                             'ready_for_cr', '--pr-url', 'https://github.com/someone/tool/pull/3', '--text', 'go',
+                             '--dry-run', '--person', 'Jacob', '--login', 'Jacob', '--agent', 'claude',
+                             '--session', 's3')
+        self.assertNotEqual(0, code)
+        code, out = self.cli(self.root, 'event', '--issue', '7', '--event', 'review_requested', '--phase',
+                             'ready_for_cr', '--pr-url', 'https://github.com/someone/tool/pull/3', '--text', 'go',
+                             '--head', 'c' * 40, '--base', 'd' * 40, '--branch-name', 'their/branch', '--dry-run',
+                             '--person', 'Jacob', '--login', 'Jacob', '--agent', 'claude', '--session', 's3')
+        self.assertEqual(0, code, out)
+        self.assertEqual('c' * 40, json.loads(out)['task']['head'])
 
     def test_doctor_warns_about_a_clone_wide_station(self):
         code, out = self.cli(self.root, 'doctor')
-        self.assertIn('station is not shared clone-wide', out)
+        self.assertIn('only this station watches here', out, 'a single-station clone is not warned')
+        mail.write_state(self.transport, 'mac', {'last_seen': {}})
+        code, out = self.cli(self.root, 'doctor')
+        self.assertIn('stations mac also watch from this clone', out)
         self.assertEqual(0, code, 'the warning is advisory')
         self.cli(self.root, 'join', '--station', 'windows', '--worktree')
         code, out = self.cli(self.root, 'doctor')
@@ -906,6 +929,19 @@ class PingPong(Fixture):
         with unittest.mock.patch.dict(os.environ, cleared):
             self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(mail.Transport(mac_root), 'mac', once=True, out=out))
         self.assertIn('reply needed', out.getvalue())
+
+    def test_a_pong_already_sent_by_another_session_counts_as_answered(self):
+        mail.send(self.transport, self.ping())
+        mac_primary, mac_root = self.clone('mac')
+        mac = mail.Transport(mac_root)
+        tip = mac.fetch()
+        ping = next(json.loads(mac.show(tip, path)) for path in run(mac_root, 'ls-tree', '-r', '--name-only', tip).split()
+                    if '-handoff-ping-' in path)
+        config = mail.load_config(mac, tip)
+        with unittest.mock.patch.dict(os.environ, self.who):
+            self.assertIsNone(mail.answer_ping(mac, config, 'mac', ping))
+        with unittest.mock.patch.dict(os.environ, dict(self.who, STATION_MAIL_SESSION='mac-interactive')):
+            self.assertIsNone(mail.answer_ping(mac, config, 'mac', ping), 'a second session sees it answered')
 
     def test_stationless_or_misaddressed_pings_are_not_answered(self):
         legacy = self.ping()

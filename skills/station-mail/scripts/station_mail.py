@@ -141,7 +141,10 @@ class Transport:
 
     def station(self):
         """This session's station: $STATION_MAIL_STATION, else git config (a worktree's own value wins)."""
-        return os.environ.get('STATION_MAIL_STATION') or self.setting('station')
+        station = os.environ.get('STATION_MAIL_STATION') or self.setting('station')
+        require(station is None or SLUG.fullmatch(station) is not None,
+                f'station {station!r} must be a lowercase slug (letters, digits, - or _)')
+        return station
 
     def station_source(self):
         if os.environ.get('STATION_MAIL_STATION'):
@@ -725,6 +728,12 @@ def write_state(transport, station, state):
     with os.fdopen(handle, 'w', encoding='utf-8') as stream:
         stream.write(json.dumps(state, indent=2) + '\n')
     os.replace(temporary, path)
+    # The old single cursor belonged to one station; once that station has its own file, retire it
+    # so a station added later starts with the usual 24-hour catch-up instead of inheriting it.
+    try:
+        transport.legacy_state_path().unlink()
+    except FileNotFoundError:
+        pass
 
 
 def watch(transport, me, poll=60, once=False, out=sys.stdout):
@@ -814,7 +823,11 @@ def answer_ping(transport, config, me, ping):
             phase='pong', recipient_station=ping['actor']['station'], recipient_actor=ping['actor']['id'],
             message_id=f"{who['LOGIN'].lower()}-{who['AGENT']}-issue{task['issue']}-pong-{digest}")
         send(transport, pong)
-    except (ValueError, RuntimeError) as error:
+    except ValueError as error:
+        if 'Message id collision' in str(error):
+            return None  # another session of this station already answered this ping
+        return f'automatic pong failed: {error}'
+    except RuntimeError as error:
         return f'automatic pong failed: {error}'
     return None
 
@@ -1019,9 +1032,12 @@ def doctor(transport):
     me = transport.station()
     source = transport.station_source()
     check('this session has a station', me, f'{me} (from {source})' if me else 'run join --station NAME')
-    check('station is not shared clone-wide', source != 'local',
-          'set in this clone\'s shared config: every worktree and agent here reads it. If another agent shares this '
-          'clone, give each `join --worktree` or $STATION_MAIL_STATION', required=False)
+    state_dir = transport.common_dir().resolve() / 'agent-stations'
+    others = sorted(path.stem[len('state-'):] for path in state_dir.glob('state-*.json') if path.stem != f'state-{me}')
+    check('no other station reads this clone-wide station', source != 'local' or not others,
+          f'stations {", ".join(others)} also watch from this clone, and every worktree here reads `{me}`: give each '
+          f'agent `join --worktree` or $STATION_MAIL_STATION' if others else 'only this station watches here',
+          required=False)
     if config and me:
         check('station is listed in stations.json', me in config['stations'], ', '.join(config['stations']))
     shapes = {'STATION_MAIL_PERSON': lambda v: identity(v, 'person'),
@@ -1297,6 +1313,11 @@ def main(argv=None):
                 require(getattr(args, flag), f'--{flag} (or $STATION_MAIL_{flag.upper()}) is required')
             transport.fetch()
             config = load_config(transport)
+            pr_repo = re.match(r'https://github\.com/([^/]+/[^/]+)/pull/', args.pr_url or '')
+            if pr_repo and pr_repo.group(1).lower() != config['repo'].lower():
+                # This checkout can't see that repository's commits, so its HEAD would be recorded by mistake.
+                require(args.head and args.base and args.branch_name,
+                        f'{args.pr_url} is in another repository: pass --head, --base and --branch-name from it')
             head = args.head or git(cwd, 'rev-parse', 'HEAD').stdout.strip()
             base = args.base
             if not base:
