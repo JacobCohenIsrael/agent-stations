@@ -101,13 +101,15 @@ class Transport:
 
     def fetch(self, branch=None, required=True):
         branch = branch or self.branch
-        for attempt in range(6):
+        attempts = 6
+        for attempt in range(attempts):
             result = git(self.root, 'fetch', '--quiet', '--no-tags', self.remote,
                          f'+refs/heads/{branch}:{self.ref(branch)}', check=False)
-            # Sessions sharing one clone can race on the remote-tracking ref lock; that is transient.
-            if result.returncode == 0 or 'lock' not in result.stderr:
+            # Sessions sharing one clone race on the remote-tracking ref lock, and on Windows on writing
+            # the same loose objects; both are transient. Anything else is reported at once.
+            if result.returncode == 0 or not TRANSIENT_FETCH.search(result.stderr) or attempt == attempts - 1:
                 break
-            time.sleep(0.2 * (attempt + 1))
+            time.sleep(random.uniform(0.1, 0.4) * (attempt + 1))
         if result.returncode:
             if required:
                 raise RuntimeError(f'Cannot fetch {self.remote}/{branch}: {result.stderr.strip()} '
@@ -225,7 +227,7 @@ def validate_config(config):
                 and isinstance(extra.get('messages_dir'), str) and extra['messages_dir'].strip('/')
                 and '..' not in extra['messages_dir'], 'also_watch entries need a branch and a messages_dir')
         hints = extra.get('session_stations', {})
-        require(isinstance(hints, dict) and all(isinstance(k, str) and k and v in stations for k, v in hints.items()),
+        require(isinstance(hints, dict) and all(isinstance(k, str) and k and isinstance(v, str) and v in stations for k, v in hints.items()),
                 'also_watch session_stations must map session-id patterns to stations')
     watched = [extra['branch'] for extra in config.get('also_watch', [])]
     # Each branch has one cursor, so each may be watched once.
@@ -554,8 +556,11 @@ def inbox(transport, actor=None, issue=None):
 # ------------------------------------------------------------------------- watch
 
 
-def sender_key(actor):
-    return f"{str(actor.get('id', '?')).lower()}@{actor.get('station') or '?'}"
+TRANSIENT_FETCH = re.compile(r'lock|unpack-objects failed|Permission denied|unable to write', re.I)
+
+
+def sender_key(actor, station=None):
+    return f"{str(actor.get('id', '?')).lower()}@{station or actor.get('station') or '?'}"
 
 
 def plain(value, limit=120):
@@ -572,15 +577,23 @@ def route(config, sender):
     return None
 
 
-def classify(message, me, config, local_branches):
-    """Why `message` needs this station's coordinator, or None when it is quiet."""
+def classify(message, me, config, local_branches, inferred=None):
+    """Why `message` needs this station's coordinator, or None when it is quiet.
+
+    `inferred` is the station `session_stations` hints give stationless mail. The legacy
+    local-branch rules run first and are unaffected by it. Review routing then tries the
+    inferred key (`login/agent@station`) and falls back to the `@?` key when no rule
+    matches, except for mail inferred to come from this station, which never routes back here.
+    """
     if not isinstance(message, dict) or not isinstance(message.get('actor'), dict):
         return None
     actor, task = message['actor'], message.get('task') or {}
     if not isinstance(task, dict):
         return None
     station, branch = actor.get('station'), task.get('branch')
-    sender = sender_key(actor)
+    inferred = None if station else inferred
+    sender = sender_key(actor, inferred)
+    senders = [sender] + ([sender_key(actor)] if inferred and inferred != me else [])
     event, phase = plain(task.get('event'), 20), plain(task.get('phase') or '', 20)
     head = task.get('head') if isinstance(task.get('head'), str) and SHA.fullmatch(task['head']) else '?'
     ref = (f"#{plain(task.get('issue'), 12)} {plain(branch or '?', 100)} @ {head} "
@@ -596,13 +609,14 @@ def classify(message, me, config, local_branches):
         if not task.get('pr_url'):
             return None  # not a usable review request
         # Routing decides, even for the sender's own station: the reviewer is a fresh session either way.
-        return f"review needed: {plain(task['pr_url'], 200)} {ref}" if route(config, sender) == me else None
+        reviewer = next((r for r in (route(config, key) for key in senders) if r), None)
+        return f"review needed: {plain(task['pr_url'], 200)} {ref}" if reviewer == me else None
     if event == 'handoff' and task.get('recipient_station') == me:
         return plain(f"{phase or 'handoff'} {task.get('verdict') or ''} for this station: ".replace('  ', ' ')) + ref
-    if station == me:
+    if (station or inferred) == me:
         return None
     watch = config.get('watch', {})
-    if any(fnmatch.fnmatchcase(sender, pattern.lower()) for pattern in watch.get('always_from', [])):
+    if any(fnmatch.fnmatchcase(key, pattern.lower()) for key in senders for pattern in watch.get('always_from', [])):
         return f'{event}/{phase or "-"} {ref}'
     if event == 'handoff':
         # An explicit recipient decides; the local-branch fallback is for older mail without one.
@@ -620,15 +634,13 @@ def local_branches(root):
 
 
 def infer_station(message, session_stations):
-    """Older mail has no actor.station: take it from the first session-id pattern that matches."""
-    actor = message.get('actor')
+    """The station older (stationless) mail came from, by the first matching session-id pattern, or None."""
+    actor = message.get('actor') if isinstance(message, dict) else None
     if not session_stations or not isinstance(actor, dict) or actor.get('station'):
-        return message
+        return None
     session = str(actor.get('session_id', '')).lower()
-    for pattern, station in session_stations.items():
-        if fnmatch.fnmatchcase(session, pattern.lower()):
-            return dict(message, actor=dict(actor, station=station))
-    return message
+    return next((station for pattern, station in session_stations.items()
+                 if fnmatch.fnmatchcase(session, pattern.lower())), None)
 
 
 def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None, session_stations=None):
@@ -646,9 +658,8 @@ def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None
             if status == 'A' and path.startswith(messages_dir + '/') and path.endswith('.json'):
                 raw = transport.show(commit, path)  # a failed read raises, so the cursor stays put
                 message = readable(raw, path, config['repo'], messages_dir)
-                if message is not None:
-                    message = infer_station(message, session_stations)
-                reason = classify(message, me, config, branches) if message is not None else None
+                reason = (classify(message, me, config, branches, infer_station(message, session_stations))
+                          if message is not None else None)
                 if reason:
                     lines.append(f'{commit[:9]} {reason}')
             elif path == CONFIG_FILE and status == 'M':

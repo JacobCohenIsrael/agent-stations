@@ -798,22 +798,89 @@ class OneCursorPerBranch(Fixture):
 class LegacySessionStations(Fixture):
     hints = {'windows-*': 'windows', 'mac-*': 'mac'}
 
-    def test_session_patterns_tag_older_mail(self):
-        own = event(kind='review_requested', phase='ready_for_cr', pr_url='https://github.com/example/game/pull/1')
-        own['actor']['session_id'] = 'windows-922-agent-stations'
-        del own['actor']['station']
-        tagged = mail.infer_station(own, self.hints)
-        self.assertEqual('windows', tagged['actor']['station'])
-        self.assertNotIn('station', own['actor'], 'the original envelope is untouched')
-        routing = [{'from': '*@mac', 'reviewer': 'windows'}, {'from': '*@?', 'reviewer': 'windows'}]
-        self.assertIsNone(mail.classify(tagged, 'windows', {'review_routing': routing[:1]}, set()))
-        theirs = json.loads(json.dumps(own))
-        theirs['actor']['session_id'] = 'mac-coordinator-review-930'
-        self.assertIn('review needed',
-                      mail.classify(mail.infer_station(theirs, self.hints), 'windows', {'review_routing': routing}, set()))
-        unknown = json.loads(json.dumps(own))
-        unknown['actor']['session_id'] = 'cranky-hodgkin-12'
-        self.assertNotIn('station', mail.infer_station(unknown, self.hints)['actor'])
+    def legacy(self, session, **extra):
+        message = event(**extra)
+        message['actor']['session_id'] = session
+        del message['actor']['station']
+        return message
+
+    def verdict(self, me, message, config, branches=()):
+        return mail.classify(message, me, config, set(branches), mail.infer_station(message, self.hints))
+
+    def test_session_patterns_name_the_station_of_older_mail(self):
+        own = self.legacy('windows-922', kind='review_requested', phase='ready_for_cr',
+                          pr_url='https://github.com/example/game/pull/1')
+        self.assertEqual('windows', mail.infer_station(own, self.hints))
+        self.assertNotIn('station', own['actor'], 'the envelope is untouched')
+        self.assertIsNone(mail.infer_station(self.legacy('cranky-hodgkin-12'), self.hints))
+        self.assertIsNone(mail.infer_station(event(), self.hints), 'a real station is never overridden')
+        routing = {'review_routing': [{'from': '*@mac', 'reviewer': 'windows'}]}
+        self.assertIsNone(self.verdict('windows', own, routing))
+        theirs = self.legacy('mac-coordinator-930', kind='review_requested', phase='ready_for_cr',
+                             pr_url='https://github.com/example/game/pull/2')
+        self.assertIn('review needed', self.verdict('windows', theirs, routing))
+
+    def test_existing_legacy_routes_still_apply_when_no_inferred_rule_matches(self):
+        theirs = self.legacy('mac-930', kind='review_requested', phase='ready_for_cr',
+                             pr_url='https://github.com/example/game/pull/3')
+        transition = {'review_routing': [{'from': 'jacob/claude@?', 'reviewer': 'windows'}]}
+        self.assertIn('review needed', self.verdict('windows', theirs, transition))
+        inferred_first = {'review_routing': [{'from': 'jacob/claude@mac', 'reviewer': 'mac'},
+                                             {'from': 'jacob/claude@?', 'reviewer': 'windows'}]}
+        self.assertIsNone(self.verdict('windows', theirs, inferred_first), 'the inferred key wins')
+        own = self.legacy('windows-931', kind='review_requested', phase='ready_for_cr', branch='elsewhere',
+                          pr_url='https://github.com/example/game/pull/4')
+        self.assertIsNone(self.verdict('windows', own, transition), 'own mail never falls back to @?')
+        always = {'watch': {'always_from': ['jacob/claude@?']}}
+        self.assertIsNotNone(self.verdict('windows', self.legacy('mac-932', kind='paused'), always))
+        self.assertIsNone(self.verdict('windows', self.legacy('windows-933', kind='paused'), always))
+
+    def test_local_branch_rules_run_before_inference(self):
+        broad = {'review_routing': [{'from': '*', 'reviewer': 'windows'}]}
+        request = self.legacy('windows-934', kind='review_requested', phase='ready_for_cr',
+                              pr_url='https://github.com/example/game/pull/5')
+        self.assertIsNone(self.verdict('windows', request, broad, {'feature/x'}),
+                          "a legacy request about a branch checked out here is this station's own")
+        result = self.legacy('windows-review-935', kind='handoff', phase='cr_result', verdict='approved',
+                             recipient_station='windows')
+        del result['task']['recipient_station']  # older verdicts named no recipient
+        self.assertIn('cr_result approved for this station',
+                      self.verdict('windows', result, {}, {'feature/x'}),
+                      "a same-station reviewer's legacy verdict still reaches the branch owner")
+        self.assertIsNone(self.verdict('windows', result, {}), 'with no local branch it is quiet')
+
+    def test_malformed_hint_values_are_config_errors(self):
+        config = mail.load_config(self.transport, self.transport.fetch())
+        for value in (['windows'], {'a': 'windows'}, 3):
+            with self.assertRaises(ValueError):
+                mail.validate_config({**config, 'also_watch': [{'branch': 'old', 'messages_dir': 'd',
+                                                                'session_stations': {'w-*': value}}]})
+
+    def test_transient_fetch_failures_are_retried_and_permanent_ones_reported(self):
+        real = mail.git
+        calls = {'n': 0}
+
+        def flaky(root, *args, **kwargs):
+            if args and args[0] == 'fetch':
+                calls['n'] += 1
+                if calls['n'] == 1:
+                    return subprocess.CompletedProcess(args, 128, '', 'error: unable to create temporary file: '
+                                                       'Permission denied\nfatal: unpack-objects failed')
+            return real(root, *args, **kwargs)
+        with unittest.mock.patch.object(mail, 'git', flaky), unittest.mock.patch.object(mail.time, 'sleep'):
+            self.assertFalse(mail.send(self.transport, event(kind='started'))['already_sent'])
+        self.assertGreater(calls['n'], 1)
+        calls['n'] = 0
+
+        def broken(root, *args, **kwargs):
+            if args and args[0] == 'fetch':
+                calls['n'] += 1
+                return subprocess.CompletedProcess(args, 128, '', 'fatal: nowhere is not a git repository')
+            return real(root, *args, **kwargs)
+        with unittest.mock.patch.object(mail, 'git', broken), unittest.mock.patch.object(mail.time, 'sleep'):
+            with self.assertRaises(RuntimeError):
+                self.transport.fetch()
+        self.assertEqual(1, calls['n'], 'a permanent failure is reported at once')
 
     def test_watch_applies_the_branch_hints_and_config_checks_them(self):
         config = mail.load_config(self.transport, self.transport.fetch())
