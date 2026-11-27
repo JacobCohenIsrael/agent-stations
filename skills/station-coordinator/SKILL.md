@@ -22,7 +22,7 @@ Handle every line the watcher printed, then restart the watcher. A wake is done 
 
 - **`review needed: <PR> ...`**: `stations.json` routes this sender's PRs to this station.
   1. Check natively that the PR is open and its head equals the head in the line. Skip it if that head already has a `cr_started` or `cr_result` from anyone, or a review comment.
-  2. Pick its worktree (see Worktree pool), then start a fresh, independent reviewer there: a subagent or a new session. Brief it with the issue, PR URL, exact head, the author's station, the project's review instructions, and the short re-review path for base-merge-only heads (station-mail Merging).
+  2. Check the station's usage allowance against `usage_stop` in `stations.json`. At or below a floor, or with no reliable reading, start no reviewer; tell the human the review is waiting. Otherwise pick its worktree (see Worktree pool) and start a fresh, independent reviewer there: a subagent or a new session. Brief it with the issue, PR URL, exact head, the author's station, the project's review instructions, and the short re-review path for base-merge-only heads (station-mail Merging).
   3. The reviewer sends `cr_started` (possible only from a linked worktree; a reviewer that had to run in the primary checkout skips it), reviews the exact head against the issue and the project's standards, posts the review as a PR comment, and sends `cr_result` with `--recipient-station <author station>`.
   4. Relay the verdict to the human in one line: PR, verdict, head.
 - **`cr_result ... for this station`**: route the verdict to the executor session that owns that branch, quoting the reviewer's message ID. The executor acts on the reviewer's own record, never on the relay.

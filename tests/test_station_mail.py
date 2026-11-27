@@ -180,9 +180,18 @@ class Classification(unittest.TestCase):
         self.assertIsNone(self.classify(event(station='linux', kind='review_requested', **pr)), 'unrouted')
 
     def test_verdicts_reach_the_branch_owner_only(self):
-        verdict = event(station='mac', kind='handoff', phase='cr_result', verdict='approved', branch='win/fix')
-        self.assertIn('cr_result approved', self.classify(verdict, local={'win/fix'}))
-        self.assertIsNone(self.classify(verdict))
+        verdict = event(station='mac', kind='handoff', phase='cr_result', verdict='approved', branch='win/fix',
+                        recipient_station='windows')
+        line = self.classify(verdict)
+        self.assertIn('cr_result approved', line)
+        self.assertIn('b' * 40, line, 'wake lines carry the exact head')
+        elsewhere = event(station='mac', kind='handoff', phase='cr_result', verdict='approved', branch='win/fix',
+                          recipient_station='cloud')
+        self.assertIsNone(self.classify(elsewhere, local={'win/fix'}), 'an explicit recipient wins over a local branch')
+        legacy = json.loads(json.dumps(verdict))
+        del legacy['task']['recipient_station']
+        self.assertIn('cr_result', self.classify(legacy, local={'win/fix'}))
+        self.assertIsNone(self.classify(legacy))
         addressed = event(station='mac', kind='handoff', phase='ownership', recipient_station='windows')
         self.assertIn('ownership', self.classify(addressed))
 
@@ -311,10 +320,21 @@ class Repairs(Fixture):
             forged['task'][field] = value
             with self.assertRaises(ValueError, msg=field):
                 mail.validate(forged, REPO)
-        no_verdict = event(kind='handoff', phase='cr_result', verdict='approved')
-        del no_verdict['task']['verdict']
+        complete = event(kind='handoff', phase='cr_result', verdict='approved', recipient_station='mac')
+        for broken in ({'verdict': None}, {'review_head': None}, {'recipient_station': None}, {'event': 'paused'}):
+            forged = json.loads(json.dumps(complete))
+            for key, value in broken.items():
+                if value is None:
+                    del forged['task'][key]
+                else:
+                    forged['task'][key] = value
+            with self.assertRaises(ValueError, msg=broken):
+                mail.validate(forged, REPO, strict=True)
+        no_station = json.loads(json.dumps(complete))
+        del no_station['actor']['station']
+        mail.validate(no_station, REPO)  # older envelopes stay readable
         with self.assertRaises(ValueError):
-            mail.validate(no_verdict, REPO)
+            mail.validate(no_station, REPO, strict=True)
         stranger = event(station='linux')
         with self.assertRaises(ValueError):
             mail.send(self.transport, stranger)
@@ -381,6 +401,70 @@ class LegacyAndSameStation(unittest.TestCase):
         verdict = event(station='windows', kind='handoff', phase='cr_result', verdict='approved',
                         recipient_station='windows')
         self.assertIn('cr_result approved', mail.classify(verdict, 'windows', {}, set()))
+
+
+class CodexReviewRepairs(Fixture):
+    def test_underscore_agent_identity_round_trips(self):
+        message = event(agent='windows_codex', kind='handoff', phase='cr_result', verdict='approved',
+                        recipient_station='windows', recipient_actor='jacob/windows_codex')
+        self.assertEqual('jacob/windows_codex', message['actor']['id'])
+        mail.send(self.transport, message)
+        config = mail.load_config(self.transport, self.transport.fetch())
+        config['review_routing'].insert(0, {'from': 'jacob/windows_codex@*', 'reviewer': 'windows'})
+        mail.apply_config(self.transport, config, 'jacob/windows_codex', 'windows', 'Jacob: route codex here')
+
+    def test_a_pause_that_wins_the_race_blocks_admission(self):
+        real = mail.load_config
+        calls = []
+
+        def stale_first(transport, revision=None):
+            config = real(transport, revision)
+            calls.append(revision)
+            if len(calls) == 1:
+                config = dict(config, paused=False)  # what the sender saw before the pause landed
+            return config
+        mail.set_paused(self.transport, True, 'quota', 'jacob/claude', 'windows', 'Jacob: pause')
+        with unittest.mock.patch.object(mail, 'load_config', stale_first):
+            with self.assertRaises(RuntimeError):
+                mail.send(self.transport, event(kind='started'))
+
+    def test_stale_config_replacement_is_refused_and_pause_survives(self):
+        snapshot = mail.load_config(self.transport, self.transport.fetch())
+        mail.set_paused(self.transport, True, 'quota', 'jacob/claude', 'windows', 'Jacob: pause')
+        snapshot['watch'] = {'always_from': ['*/codex@*']}
+        with self.assertRaises(ValueError):
+            mail.apply_config(self.transport, snapshot, 'jacob/claude', 'windows', 'Jacob: watch codex')
+        self.assertTrue(mail.load_config(self.transport, self.transport.fetch())['paused'])
+        with self.assertRaises(ValueError):
+            mail.validate_config({**snapshot, 'watch': {'always_from': [1]}})
+
+    def test_archive_retry_keeps_a_thread_reopened_meanwhile(self):
+        old = datetime.datetime(2026, 1, 1, tzinfo=UTC)
+        for message in (event(issue=1, branch='a', now=old),
+                        event(issue=1, branch='a', kind='finished', now=old + datetime.timedelta(hours=1))):
+            mail.send(self.transport, message)
+        _, other = self.clone('mac')
+        competitor = mail.Transport(other)
+        original = self.transport.append
+
+        def raced(prepare, subject, attempts=10):
+            if not getattr(raced, 'done', False):
+                raced.done = True
+                mail.send(competitor, event(station='mac', issue=1, branch='a', kind='resumed'), cwd=other)
+            return original(prepare, subject, attempts)
+        self.transport.append = raced
+        result = mail.archive(self.transport, 'jacob/claude', now=datetime.datetime(2026, 3, 1, tzinfo=UTC),
+                              issue_closed=lambda issue: False)
+        self.assertFalse(result['archived'])
+        self.assertEqual(3, len(mail.inbox(self.transport, issue=1)['messages']))
+
+    def test_doctor_checks_identity_shapes(self):
+        with unittest.mock.patch.dict('os.environ', {'STATION_MAIL_PERSON': 'Jacob', 'STATION_MAIL_LOGIN': 'jacob',
+                                                     'STATION_MAIL_AGENT': 'Bad Agent', 'STATION_MAIL_SESSION': 's'}):
+            rows = {r['check']: r for r in mail.doctor(self.transport)}
+        self.assertFalse(rows['STATION_MAIL_AGENT valid']['ok'])
+        self.assertTrue(rows['STATION_MAIL_AGENT valid']['required'])
+        self.assertTrue(rows['STATION_MAIL_LOGIN valid']['ok'])
 
 
 class WorktreeReuseAndRereview(Fixture):

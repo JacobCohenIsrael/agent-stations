@@ -16,7 +16,7 @@ All commands use the bundled `scripts/station_mail.py` (Python 3.11+, git, an au
 ```text
 STATION_MAIL_PERSON=Jacob            # the human this agent works for
 STATION_MAIL_LOGIN=JacobCohenIsrael  # that human's GitHub login
-STATION_MAIL_AGENT=claude            # agent slug: claude, codex, ...
+STATION_MAIL_AGENT=claude            # agent slug (lowercase, digits, - or _): claude, codex, windows_codex
 STATION_MAIL_SESSION=<unique id>     # distinguishes parallel or replacement sessions
 ```
 

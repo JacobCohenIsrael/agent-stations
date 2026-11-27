@@ -32,7 +32,6 @@ Per-machine watcher state (the last-seen commit for each watched branch) lives i
   "base_branch": "main",
   "paused": false,
   "pause_reason": "",
-  "require_linked_worktree": true,
   "stations": {
     "windows": {"description": "Jacob's Windows PC: Claude coordinator"},
     "mac": {"description": "Jacob's MacBook: Claude"}
@@ -64,7 +63,7 @@ Per-machine watcher state (the last-seen commit for each watched branch) lives i
 - `also_watch`: extra `{"branch", "messages_dir"}` mailboxes that `watch` and `inbox` read, for migrating from an older mail branch. Old messages have no station, so their sender key ends in `@?`. During the transition, add routing rules such as `{"from": "jacobcohenisrael/claude@?", "reviewer": "windows"}`. Legacy mail about a branch checked out on this machine always counts as this station's own.
 - `changes`: an append-only record of each config change (`at`, `by`, `quote`), written by `config apply`, `config pause` and `config resume`.
 
-Change config only on the human's own direct instruction, and quote it with `--quote`. `config pause --reason ... --quote ...` stops admission events on every station; `config resume --quote ...` lifts the pause.
+Change config only on the human's own direct instruction, and quote it with `--quote`. `config apply` takes an edited copy of `config show`. If anyone changed `stations.json` in the meantime, it refuses, so run `config show` again and redo the edit. `config pause --reason ... --quote ...` stops admission events on every station, and `config resume --quote ...` lifts the pause. Both act on the latest config, and senders re-check the pause on every append attempt.
 
 ## Pre-push reminder (optional)
 

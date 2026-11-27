@@ -46,7 +46,7 @@ DEFAULT_MERGE_POLICY = {
                     'new dependencies', 'save-format changes', 'releases'],
 }
 
-SLUG = re.compile(r'[a-z0-9]+(?:-[a-z0-9]+)*\Z')
+SLUG = re.compile(r'[a-z0-9]+(?:[-_][a-z0-9]+)*\Z')
 SAFE_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z')
 LOGIN = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?\Z')
 REPO = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}\Z')
@@ -186,19 +186,21 @@ def validate_config(config):
     routing = config.get('review_routing', [])
     require(isinstance(routing, list), 'review_routing must be a list')
     for rule in routing:
-        require(isinstance(rule, dict) and isinstance(rule.get('from'), str), 'each routing rule needs "from"')
+        require(isinstance(rule, dict) and isinstance(rule.get('from'), str) and rule['from'],
+                'each routing rule needs a non-empty "from"')
         require(rule.get('reviewer') in stations, f'routing reviewer {rule.get("reviewer")!r} is not a station')
     watch = config.get('watch', {})
     require(isinstance(watch, dict), 'watch must be an object')
     for key in ('always_from', 'notify_events'):
-        require(isinstance(watch.get(key, []), list), f'watch.{key} must be a list')
+        require(isinstance(watch.get(key, []), list) and all(isinstance(x, str) and x for x in watch.get(key, [])),
+                f'watch.{key} must be a list of non-empty strings')
     for extra in config.get('also_watch', []):
-        require(isinstance(extra, dict) and isinstance(extra.get('branch'), str)
-                and isinstance(extra.get('messages_dir'), str), 'also_watch entries need branch and messages_dir')
+        require(isinstance(extra, dict) and valid_branch(extra.get('branch'))
+                and isinstance(extra.get('messages_dir'), str) and extra['messages_dir'].strip('/')
+                and '..' not in extra['messages_dir'], 'also_watch entries need a branch and a messages_dir')
     archive = config.get('archive', {})
     require(isinstance(archive, dict) and type(archive.get('after_days', 30)) is int
             and archive.get('after_days', 30) >= 1, 'archive.after_days must be a positive integer')
-    require(isinstance(config.get('require_linked_worktree', True), bool), 'require_linked_worktree must be boolean')
     require(isinstance(config.get('changes', []), list), 'changes must be a list')
     pool = config.get('worktree_pool', {})
     require(isinstance(pool, dict) and type(pool.get('max', DEFAULT_POOL)) is int and pool.get('max', DEFAULT_POOL) >= 1,
@@ -242,8 +244,19 @@ def valid_branch(branch):
             and all(not part.startswith('.') and not part.endswith('.lock') for part in branch.split('/')))
 
 
-def validate(message, repo, messages_dir=MESSAGES):
-    """Check one STATUS envelope; return its path on the mail branch."""
+REVIEW_PHASES = {  # phase: (event, fields every newly written message of that phase must carry)
+    'ready_for_cr': ('review_requested', ('pr_url', 'review_head')),
+    'cr_started': ('started', ('review_head',)),
+    'cr_result': ('handoff', ('verdict', 'review_head', 'recipient_station')),
+}
+
+
+def validate(message, repo, messages_dir=MESSAGES, strict=False):
+    """Check one STATUS envelope; return its path on the mail branch.
+
+    `strict` is for newly written mail: the sender's station and the full review-phase contract are
+    required. Reading stays lenient so older envelopes remain inspectable.
+    """
     require(isinstance(message, dict), 'Message must be a JSON object')
     require(type(message.get('schema_version')) is int and message['schema_version'] == 1, 'schema_version must be 1')
     require(message.get('type') == 'STATUS', 'Only STATUS may be sent')
@@ -291,7 +304,7 @@ def validate(message, repo, messages_dir=MESSAGES):
         require(value is None or (isinstance(value, str) and 0 < len(value) <= 300
                                   and all(c.isprintable() for c in value)), f'task.{field} must be printable text')
     recipient = task.get('recipient_actor')
-    require(recipient is None or (isinstance(recipient, str) and re.fullmatch(r'[a-z0-9-]{1,39}/[a-z0-9-]{1,64}', recipient)),
+    require(recipient is None or (isinstance(recipient, str) and re.fullmatch(r'[a-z0-9-]{1,39}/[a-z0-9_-]{1,64}', recipient)),
             'task.recipient_actor must be login/agent')
     require(task.get('intake_returned') in (None, True) and (not task.get('intake_returned') or task['event'] == 'finished'),
             'intake_returned is only valid as true on finished')
@@ -300,6 +313,13 @@ def validate(message, repo, messages_dir=MESSAGES):
             for field in fields:
                 require(task.get(field), f'phase {need} requires task.{field}')
     require(isinstance(message.get('text'), str), 'text must be a string')
+    if strict:
+        require(isinstance(actor.get('station'), str), 'actor.station is required on new mail')
+        if phase in REVIEW_PHASES:
+            event, fields = REVIEW_PHASES[phase]
+            require(task['event'] == event, f'phase {phase} belongs to event {event}')
+            for field in fields:
+                require(task.get(field), f'phase {phase} requires task.{field}')
     try:
         json.dumps(message, allow_nan=False)
     except (ValueError, TypeError):
@@ -320,6 +340,8 @@ def build_event(*, repo, issue, event, branch, base, head, text, person, login, 
     require(verdict is None or verdict in VERDICTS, 'verdict must be one of ' + ', '.join(sorted(VERDICTS)))
     require(station and SLUG.fullmatch(station), 'station is required (git config stations.station, or --station)')
     require(recipient_station is None or SLUG.fullmatch(recipient_station), 'recipient station must be a slug')
+    if phase == 'cr_result':
+        require(recipient_station, 'phase cr_result requires --recipient-station (the author\'s station)')
     if phase in ('ready_for_cr', 'cr_result', 'cr_started'):
         review_head = review_head or head
         require(review_head == head, 'review_head must equal head (the exact reviewed head)')
@@ -347,7 +369,7 @@ def build_event(*, repo, issue, event, branch, base, head, text, person, login, 
                'actor': {'id': f'{login}/{agent}', 'person': person, 'github_login': login, 'agent': agent,
                          'station': station, 'display_name': f"{person}'s {agent.title()}", 'session_id': session},
                'task': task, 'text': text}
-    validate(message, repo)
+    validate(message, repo, strict=True)
     return message
 
 
@@ -386,21 +408,22 @@ def send(transport, message, cwd=None):
     """Append one message; idempotent for an identical payload under the same id."""
     transport.fetch()
     config = load_config(transport)
-    path = validate(message, config['repo'])
-    station = message['actor'].get('station')
-    require(station is None or station in config['stations'], f'actor.station {station!r} is not in stations.json')
+    path = validate(message, config['repo'], strict=True)
     event = message['task']['event']
-    if event in ADMISSION_EVENTS:
-        if config.get('paused'):
-            raise RuntimeError('Stations are paused (' + str(config.get('pause_reason') or 'no reason given')
-                               + '); only paused, handoff and finished may be sent')
-        if config.get('require_linked_worktree', True) and not is_linked_worktree(cwd or transport.root):
-            raise RuntimeError('started, resumed and review_requested must be sent from a linked Git worktree; '
-                               'the primary checkout stays read-only')
+    if event in ADMISSION_EVENTS and not is_linked_worktree(cwd or transport.root):
+        raise RuntimeError('started, resumed and review_requested must be sent from a linked Git worktree; '
+                           'the primary checkout stays read-only')
     payload = payload_bytes(message)
     receipt = {}
 
     def prepare(tip):
+        # Checked against the exact parent of this attempt, so a pause that wins the race is honoured.
+        current = load_config(transport, tip)
+        station = message['actor']['station']
+        require(station in current['stations'], f'actor.station {station!r} is not in stations.json')
+        if event in ADMISSION_EVENTS and current.get('paused'):
+            raise RuntimeError('Stations are paused (' + str(current.get('pause_reason') or 'no reason given')
+                               + '); only paused, handoff and finished may be sent')
         if transport.exists(tip, path):
             if not same_json(transport.show(tip, path), payload):
                 raise ValueError('Message id collision: a different payload exists at ' + path)
@@ -507,8 +530,8 @@ def classify(message, me, config, local_branches):
         return None  # legacy mail (no station) about a branch checked out here came from this station
     sender = sender_key(actor)
     event, phase = plain(task.get('event'), 20), plain(task.get('phase') or '', 20)
-    ref = plain(f"#{task.get('issue')} {branch or '?'} @ {str(task.get('head', '?'))[:8]} "
-                f"from {sender} ({actor.get('session_id')})", 240)
+    ref = plain(f"#{task.get('issue')} {branch or '?'} @ {task.get('head', '?')} "
+                f"from {sender} ({actor.get('session_id')})", 300)
     if event == 'review_requested':
         # Routing decides, even for the sender's own station: the reviewer is a fresh session either way.
         return f"review needed: {plain(task.get('pr_url', '?'))} {ref}" if route(config, sender) == me else None
@@ -520,7 +543,8 @@ def classify(message, me, config, local_branches):
     if any(fnmatch.fnmatchcase(sender, pattern.lower()) for pattern in watch.get('always_from', [])):
         return f'{event}/{phase or "-"} {ref}'
     if event == 'handoff':
-        if branch in local_branches:
+        # An explicit recipient decides; the local-branch fallback is for older mail without one.
+        if not task.get('recipient_station') and branch in local_branches:
             return plain(f"{phase or 'handoff'} {task.get('verdict') or ''} for this station: ".replace('  ', ' ')) + ref
         return None
     if event in watch.get('notify_events', DEFAULT_NOTIFY):
@@ -548,8 +572,8 @@ def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None
             if status == 'A' and path.startswith(messages_dir + '/') and path.endswith('.json'):
                 try:
                     reason = classify(json.loads(transport.show(commit, path)), me, config, branches)
-                except (ValueError, UnicodeError):
-                    reason = None
+                except (ValueError, UnicodeError, TypeError, AttributeError, KeyError, RuntimeError):
+                    reason = None  # malformed mail never blocks the cursor
                 if reason:
                     lines.append(f'{commit[:9]} {reason}')
             elif path == CONFIG_FILE and status == 'M':
@@ -666,7 +690,14 @@ def gh_issue_closed(repo):
 def archive(transport, actor_label, dry_run=False, now=None, issue_closed=None):
     tip = transport.fetch()
     config = load_config(transport, tip)
-    paths = archive_plan(transport, tip, config, now, issue_closed or gh_issue_closed(config['repo']))
+    closed = issue_closed if issue_closed is not None else gh_issue_closed(config['repo'])
+    cache = {}
+
+    def remembered(issue):
+        if issue not in cache:
+            cache[issue] = bool(closed and closed(issue))
+        return cache[issue]
+    paths = archive_plan(transport, tip, config, now, remembered)
     if dry_run or not paths:
         return {'eligible': len(paths), 'paths': paths, 'archived': False}
     require(actor_label, 'archive needs --login and --agent (or $STATION_MAIL_LOGIN / _AGENT)')
@@ -678,8 +709,13 @@ def archive(transport, actor_label, dry_run=False, now=None, issue_closed=None):
     git(transport.root, 'tag', '-f', tag, tip)
     git(transport.root, 'push', '--quiet', transport.remote, f'refs/tags/{tag}')
 
+    tagged = set(paths)
+
     def prepare(current):
-        present = [p for p in paths if transport.exists(current, p)]
+        # A competing `resumed` may have reopened a thread since the plan: re-plan at this parent and keep
+        # only paths the pushed tag already holds.
+        still = set(archive_plan(transport, current, load_config(transport, current), now, remembered))
+        present = sorted(p for p in tagged & still if transport.exists(current, p))
         if not present:
             return None
         index = transport.show(current, ARCHIVE_INDEX) if transport.exists(current, ARCHIVE_INDEX) else b''
@@ -722,7 +758,6 @@ def init(transport, repo=None, base_branch='main', stations=('main',)):
     require(repo and REPO.fullmatch(repo), 'Pass --repo owner/name (could not infer it from the remote URL)')
     config = validate_config({
         'schema_version': 1, 'repo': repo, 'base_branch': base_branch, 'paused': False, 'pause_reason': '',
-        'require_linked_worktree': True,
         'stations': {name: {'description': ''} for name in stations},
         'review_routing': [], 'watch': {'always_from': [], 'notify_events': DEFAULT_NOTIFY},
         'archive': {'after_days': 30}, 'worktree_pool': {'max': DEFAULT_POOL},
@@ -740,28 +775,43 @@ def init(transport, repo=None, base_branch='main', stations=('main',)):
     return {'branch': transport.branch, 'commit': commit, 'config': config}
 
 
-def apply_config(transport, new_config, actor_label, station, quote, now=None):
-    """Replace stations.json, recording who changed it and the human's own words."""
+def change_config(transport, mutate, actor_label, station, quote, now=None):
+    """Write `mutate(latest config)` to stations.json, recording who changed it and the human's own words.
+
+    `mutate` runs on the config at the exact parent of each append attempt, so a concurrent change is
+    never overwritten by an older snapshot.
+    """
     require(isinstance(quote, str) and quote.strip(), 'Record the human instruction with --quote')
-    validate_config(new_config)
     stamp = (now or datetime.datetime.now(datetime.timezone.utc)).replace(microsecond=0).isoformat()
 
     def prepare(tip):
         current = load_config(transport, tip)
-        merged = dict(new_config)
-        merged['changes'] = current.get('changes', []) + [{'at': stamp, 'by': f'{actor_label}@{station}', 'quote': quote}]
-        validate_config(merged)
-        return {CONFIG_FILE: config_bytes(merged)}
+        updated = mutate(json.loads(json.dumps(current)))
+        updated['changes'] = current.get('changes', []) + [{'at': stamp, 'by': f'{actor_label}@{station}', 'quote': quote}]
+        validate_config(updated)
+        return {CONFIG_FILE: config_bytes(updated)}
 
     commit = transport.append(prepare, f'stations-config({actor_label}@{station}): {quote[:60]}')
     return {'commit': commit}
 
 
+def apply_config(transport, new_config, actor_label, station, quote, now=None):
+    """Replace stations.json with an edited copy of `config show`; refuses when the config moved since."""
+    validate_config(new_config)
+
+    def replace(current):
+        require(new_config.get('changes', []) == current.get('changes', []),
+                'stations.json changed since this copy was taken; run `config show` again and reapply the edit')
+        return dict(new_config)
+    return change_config(transport, replace, actor_label, station, quote, now)
+
+
 def set_paused(transport, paused, reason, actor_label, station, quote):
-    config = load_config(transport, transport.fetch())
-    config['paused'] = paused
-    config['pause_reason'] = reason if paused else ''
-    return apply_config(transport, config, actor_label, station, quote)
+    def toggle(current):
+        current['paused'] = paused
+        current['pause_reason'] = reason if paused else ''
+        return current
+    return change_config(transport, toggle, actor_label, station, quote)
 
 
 # ------------------------------------------------------------------------ doctor
@@ -790,8 +840,20 @@ def doctor(transport):
     check('this machine has a station (git config stations.station)', me, me or 'run join --station NAME')
     if config and me:
         check('station is listed in stations.json', me in config['stations'], ', '.join(config['stations']))
-    for variable in ('STATION_MAIL_PERSON', 'STATION_MAIL_LOGIN', 'STATION_MAIL_AGENT', 'STATION_MAIL_SESSION'):
-        check(f'{variable} set (or pass flags)', os.environ.get(variable), os.environ.get(variable, ''), False)
+    shapes = {'STATION_MAIL_PERSON': lambda v: identity(v, 'person'),
+              'STATION_MAIL_LOGIN': lambda v: require(LOGIN.fullmatch(v.lower()), 'not a GitHub login'),
+              'STATION_MAIL_AGENT': lambda v: require(SLUG.fullmatch(v), 'agent must be lowercase letters, digits, - or _'),
+              'STATION_MAIL_SESSION': lambda v: identity(v, 'session')}
+    for variable, shape in shapes.items():
+        value = os.environ.get(variable)
+        if not value:
+            check(f'{variable} set (or pass flags)', False, '', False)
+            continue
+        try:
+            shape(value)
+            check(f'{variable} valid', True, value)
+        except ValueError as error:
+            check(f'{variable} valid', False, f'{value!r}: {error}')
     hooks_dir = Path(git(transport.root, 'rev-parse', '--git-path', 'hooks').stdout.strip())  # honours core.hooksPath
     if not hooks_dir.is_absolute():
         hooks_dir = transport.root / hooks_dir
@@ -828,8 +890,10 @@ def worktrees(root, base_ref, pr_state=None):
         if not path.is_dir():
             reasons.append('folder missing (git worktree prune)')
         else:
-            status = git(path, 'status', '--porcelain', '--untracked-files=normal', check=False).stdout.strip()
-            if status:
+            status = git(path, 'status', '--porcelain', '--untracked-files=normal', check=False)
+            if status.returncode:
+                reasons.append('git status failed: ' + plain(status.stderr.strip()))
+            elif status.stdout.strip():
                 reasons.append('uncommitted or untracked work')
             try:
                 gitdir = Path(git(path, 'rev-parse', '--absolute-git-dir').stdout.strip())
