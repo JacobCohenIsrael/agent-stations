@@ -459,12 +459,97 @@ class CodexReviewRepairs(Fixture):
         self.assertEqual(3, len(mail.inbox(self.transport, issue=1)['messages']))
 
     def test_doctor_checks_identity_shapes(self):
-        with unittest.mock.patch.dict('os.environ', {'STATION_MAIL_PERSON': 'Jacob', 'STATION_MAIL_LOGIN': 'jacob',
-                                                     'STATION_MAIL_AGENT': 'Bad Agent', 'STATION_MAIL_SESSION': 's'}):
+        import os
+        values = {'STATION_MAIL_PERSON': 'Jacob', 'STATION_MAIL_LOGIN': 'jacob',
+                  'STATION_MAIL_AGENT': 'Bad Agent', 'STATION_MAIL_SESSION': 's'}
+        # Only these four keys change: restoring a whole os.environ snapshot drops empty values on Windows.
+        saved = {key: os.environ.get(key) for key in values}
+        os.environ.update(values)
+        try:
             rows = {r['check']: r for r in mail.doctor(self.transport)}
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
         self.assertFalse(rows['STATION_MAIL_AGENT valid']['ok'])
         self.assertTrue(rows['STATION_MAIL_AGENT valid']['required'])
         self.assertTrue(rows['STATION_MAIL_LOGIN valid']['ok'])
+
+
+class CodexRereviewRepairs(Fixture):
+    def test_reopened_issue_is_rechecked_on_every_archive_attempt(self):
+        old = datetime.datetime(2026, 1, 1, tzinfo=UTC)
+        mail.send(self.transport, event(issue=5, branch='a', now=old))
+        _, other = self.clone('mac')
+        competitor = mail.Transport(other)
+        original = self.transport.append
+        state = {'open': False}
+
+        def raced(prepare, subject, attempts=10):
+            if not state['open']:
+                state['open'] = True  # the issue reopens and work resumes after the first plan
+                mail.send(competitor, event(station='mac', issue=5, branch='a', kind='resumed'), cwd=other)
+            return original(prepare, subject, attempts)
+        self.transport.append = raced
+        result = mail.archive(self.transport, 'jacob/claude', now=datetime.datetime(2026, 3, 1, tzinfo=UTC),
+                              issue_closed=lambda issue: not state['open'])
+        self.assertFalse(result['archived'])
+        self.assertEqual(2, len(mail.inbox(self.transport, issue=5)['messages']))
+
+    def test_stationless_verdict_reaches_the_branch_owner(self):
+        verdict = event(station='mac', kind='handoff', phase='cr_result', verdict='changes_required',
+                        branch='win/fix', recipient_station='windows')
+        del verdict['actor']['station']
+        del verdict['task']['recipient_station']
+        self.assertIn('cr_result changes_required', mail.classify(verdict, 'windows', {}, {'win/fix'}))
+        request = event(station='mac', kind='review_requested', phase='ready_for_cr', branch='win/fix',
+                        pr_url='https://github.com/example/game/pull/9')
+        del request['actor']['station']
+        self.assertIsNone(mail.classify(request, 'windows', {'review_routing': [{'from': '*', 'reviewer': 'windows'}]},
+                                        {'win/fix'}), "the owner's own old request stays quiet")
+
+    def test_long_fields_never_hide_the_exact_head(self):
+        request = event(station='mac', kind='review_requested', phase='ready_for_cr', branch='b/' + 'x' * 240,
+                        pr_url='https://github.com/example/game/pull/9')
+        line = mail.classify(request, 'windows', {'review_routing': [{'from': '*', 'reviewer': 'windows'}]}, set())
+        self.assertIn('b' * 40, line)
+
+    def test_bare_review_request_is_refused_and_skipped(self):
+        with self.assertRaises(ValueError):
+            event(kind='review_requested')
+        bare = event(kind='started')
+        bare['task']['event'] = 'review_requested'  # hand-built, as `send --message-file` would accept
+        with self.assertRaises(ValueError):
+            mail.validate(bare, REPO, strict=True)
+        self.assertIsNone(mail.classify(dict(bare, actor=dict(bare['actor'], station='mac')), 'windows',
+                                        {'review_routing': [{'from': '*', 'reviewer': 'windows'}]}, set()))
+
+    def test_failed_git_read_keeps_the_cursor(self):
+        _, mac = self.clone('mac')
+        mac_transport = mail.Transport(mac)
+        mail.watch(mac_transport, 'mac', once=True, out=io.StringIO())
+        mail.send(self.transport, event(kind='review_requested', phase='ready_for_cr',
+                                        pr_url='https://github.com/example/game/pull/6'))
+        real_show = mail.Transport.show
+
+        def failing(transport, revision, path):
+            if path.startswith('messages/'):
+                raise RuntimeError('simulated read failure')
+            return real_show(transport, revision, path)
+        with unittest.mock.patch.object(mail.Transport, 'show', failing):
+            self.assertEqual(mail.EXIT_QUIET, mail.watch(mac_transport, 'mac', once=True, out=io.StringIO()))
+        out = io.StringIO()
+        self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(mac_transport, 'mac', once=True, out=out))
+        self.assertIn('pull/6', out.getvalue())
+
+    def test_invalid_config_types_are_validation_errors(self):
+        config = mail.load_config(self.transport, self.transport.fetch())
+        for bad in ({**config, 'also_watch': None}, {**config, 'review_routing': [{'from': '*', 'reviewer': ['mac']}]},
+                    {**config, 'watch': None}, {**config, 'changes': None}):
+            with self.assertRaises(ValueError):
+                mail.validate_config(bad)
 
 
 class WorktreeReuseAndRereview(Fixture):

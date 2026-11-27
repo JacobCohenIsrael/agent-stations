@@ -185,10 +185,15 @@ def validate_config(config):
         require(isinstance(station, dict), f'station {name} must be an object')
     routing = config.get('review_routing', [])
     require(isinstance(routing, list), 'review_routing must be a list')
+    for key in ('also_watch', 'changes'):
+        require(isinstance(config.get(key, []), list), f'{key} must be a list')
+    for key in ('watch', 'archive', 'worktree_pool', 'merge_policy'):
+        require(isinstance(config.get(key, {}), dict), f'{key} must be an object')
     for rule in routing:
         require(isinstance(rule, dict) and isinstance(rule.get('from'), str) and rule['from'],
                 'each routing rule needs a non-empty "from"')
-        require(rule.get('reviewer') in stations, f'routing reviewer {rule.get("reviewer")!r} is not a station')
+        require(isinstance(rule.get('reviewer'), str) and rule['reviewer'] in stations,
+                f'routing reviewer {rule.get("reviewer")!r} is not a station')
     watch = config.get('watch', {})
     require(isinstance(watch, dict), 'watch must be an object')
     for key in ('always_from', 'notify_events'):
@@ -315,6 +320,8 @@ def validate(message, repo, messages_dir=MESSAGES, strict=False):
     require(isinstance(message.get('text'), str), 'text must be a string')
     if strict:
         require(isinstance(actor.get('station'), str), 'actor.station is required on new mail')
+        require(task['event'] != 'review_requested' or phase == 'ready_for_cr',
+                'review_requested must use phase ready_for_cr')
         if phase in REVIEW_PHASES:
             event, fields = REVIEW_PHASES[phase]
             require(task['event'] == event, f'phase {phase} belongs to event {event}')
@@ -526,13 +533,21 @@ def classify(message, me, config, local_branches):
     if not isinstance(task, dict):
         return None
     station, branch = actor.get('station'), task.get('branch')
-    if station is None and branch in local_branches:
-        return None  # legacy mail (no station) about a branch checked out here came from this station
     sender = sender_key(actor)
     event, phase = plain(task.get('event'), 20), plain(task.get('phase') or '', 20)
-    ref = plain(f"#{task.get('issue')} {branch or '?'} @ {task.get('head', '?')} "
-                f"from {sender} ({actor.get('session_id')})", 300)
+    head = task.get('head') if isinstance(task.get('head'), str) and SHA.fullmatch(task['head']) else '?'
+    ref = (f"#{plain(task.get('issue'), 12)} {plain(branch or '?', 100)} @ {head} "
+           f"from {plain(sender, 120)} ({plain(actor.get('session_id'), 80)})")
+    legacy_local = station is None and branch in local_branches
+    if legacy_local:
+        # Older mail has no station. A verdict about a branch checked out here is for this station's
+        # executor; anything else about such a branch came from this station.
+        if event == 'handoff' and task.get('phase') == 'cr_result' and not task.get('recipient_station'):
+            return plain(f"cr_result {task.get('verdict') or ''} for this station: ".replace('  ', ' ')) + ref
+        return None
     if event == 'review_requested':
+        if not task.get('pr_url'):
+            return None  # not a usable review request
         # Routing decides, even for the sender's own station: the reviewer is a fresh session either way.
         return f"review needed: {plain(task.get('pr_url', '?'))} {ref}" if route(config, sender) == me else None
     if event == 'handoff' and task.get('recipient_station') == me:
@@ -570,10 +585,13 @@ def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None
         for row in changes.splitlines():
             status, _, path = row.partition('\t')
             if status == 'A' and path.startswith(messages_dir + '/') and path.endswith('.json'):
+                raw = transport.show(commit, path)  # a failed read raises, so the cursor stays put
                 try:
-                    reason = classify(json.loads(transport.show(commit, path)), me, config, branches)
-                except (ValueError, UnicodeError, TypeError, AttributeError, KeyError, RuntimeError):
-                    reason = None  # malformed mail never blocks the cursor
+                    message = json.loads(raw)
+                    validate(message, config['repo'], messages_dir)
+                    reason = classify(message, me, config, branches)
+                except (ValueError, UnicodeError, TypeError, AttributeError, KeyError):
+                    reason = None  # malformed mail is skipped and never blocks the cursor
                 if reason:
                     lines.append(f'{commit[:9]} {reason}')
             elif path == CONFIG_FILE and status == 'M':
@@ -618,7 +636,11 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
                 continue
             if transport.fetch(branch, required=False) is None:
                 continue
-            found += scan(transport, config, me, seen.get(branch), tip, messages_dir)
+            try:
+                found += scan(transport, config, me, seen.get(branch), tip, messages_dir)
+            except RuntimeError as error:
+                print(f'warning: could not read {branch}; will retry: {error}', file=sys.stderr)
+                continue
             advanced[branch] = tip
         if found:
             print('ACTIONABLE STATION MAIL:', file=out)
@@ -691,13 +713,7 @@ def archive(transport, actor_label, dry_run=False, now=None, issue_closed=None):
     tip = transport.fetch()
     config = load_config(transport, tip)
     closed = issue_closed if issue_closed is not None else gh_issue_closed(config['repo'])
-    cache = {}
-
-    def remembered(issue):
-        if issue not in cache:
-            cache[issue] = bool(closed and closed(issue))
-        return cache[issue]
-    paths = archive_plan(transport, tip, config, now, remembered)
+    paths = archive_plan(transport, tip, config, now, closed)
     if dry_run or not paths:
         return {'eligible': len(paths), 'paths': paths, 'archived': False}
     require(actor_label, 'archive needs --login and --agent (or $STATION_MAIL_LOGIN / _AGENT)')
@@ -714,7 +730,7 @@ def archive(transport, actor_label, dry_run=False, now=None, issue_closed=None):
     def prepare(current):
         # A competing `resumed` may have reopened a thread since the plan: re-plan at this parent and keep
         # only paths the pushed tag already holds.
-        still = set(archive_plan(transport, current, load_config(transport, current), now, remembered))
+        still = set(archive_plan(transport, current, load_config(transport, current), now, closed))
         present = sorted(p for p in tagged & still if transport.exists(current, p))
         if not present:
             return None
