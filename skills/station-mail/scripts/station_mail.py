@@ -15,6 +15,7 @@ it to read issue state). Run `station_mail.py --help` for the commands.
 import argparse
 import datetime
 import fnmatch
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -257,6 +258,26 @@ def validate(message, repo, messages_dir=MESSAGES):
     require(valid_branch(task.get('branch')), 'Unsafe task.branch')
     for field in ('base', 'head'):
         require(isinstance(task.get(field), str) and SHA.fullmatch(task[field]), f'task.{field} must be 40 hex digits')
+    # Optional fields reach the coordinator's wake output, so each one is held to its exact shape.
+    phase = task.get('phase')
+    require(phase is None or (isinstance(phase, str) and SLUG.fullmatch(phase.replace('_', '-'))), 'Unsafe task.phase')
+    require(task.get('verdict') is None or task['verdict'] in VERDICTS, 'Unknown task.verdict')
+    require(task.get('pr_url') is None or (isinstance(task['pr_url'], str) and re.fullmatch(
+        rf'https://github\.com/{re.escape(repo)}/pull/[1-9][0-9]*', task['pr_url'])),
+        'pr_url must be a pull request URL of the configured repository')
+    require(task.get('review_head') is None or task['review_head'] == task['head'], 'review_head must equal head')
+    for field in ('recipient_station',):
+        require(task.get(field) is None or (isinstance(task[field], str) and SLUG.fullmatch(task[field])),
+                f'task.{field} must be a lowercase slug')
+    recipient = task.get('recipient_actor')
+    require(recipient is None or (isinstance(recipient, str) and re.fullmatch(r'[a-z0-9-]{1,39}/[a-z0-9-]{1,64}', recipient)),
+            'task.recipient_actor must be login/agent')
+    require(task.get('intake_returned') in (None, True) and (not task.get('intake_returned') or task['event'] == 'finished'),
+            'intake_returned is only valid as true on finished')
+    for need, fields in PHASE_FIELDS.items():
+        if phase == need:
+            for field in fields:
+                require(task.get(field), f'phase {need} requires task.{field}')
     require(isinstance(message.get('text'), str), 'text must be a string')
     try:
         json.dumps(message, allow_nan=False)
@@ -290,7 +311,10 @@ def build_event(*, repo, issue, event, branch, base, head, text, person, login, 
     if intake_returned:
         require(event == 'finished', 'intake_returned is only valid on finished')
         task['intake_returned'] = True
-    suffix = '-'.join(p for p in (event.replace('_', '-'), (phase or '').replace('_', '-'), head[:8]) if p)
+    # The digest keeps a retry of the same command idempotent, while a new report at the same head, or a
+    # parallel session or branch on the same issue, gets its own id.
+    digest = hashlib.sha256('\0'.join((text, branch, session, station)).encode('utf-8')).hexdigest()[:8]
+    suffix = '-'.join(p for p in (event.replace('_', '-'), (phase or '').replace('_', '-'), head[:8], digest) if p)
     message = {'schema_version': 1, 'type': 'STATUS',
                'id': message_id or f'{login}-{agent}-issue{issue}-{suffix}',
                'created_at_utc': (now or datetime.datetime.now(datetime.timezone.utc)).replace(microsecond=0).isoformat(),
@@ -307,9 +331,14 @@ def payload_bytes(message):
 
 
 def same_json(left, right):
+    """Same message, ignoring created_at_utc so re-running an `event` command is a safe retry."""
+    def canonical(raw):
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            data.pop('created_at_utc', None)
+        return json.dumps(data, sort_keys=True, ensure_ascii=False)
     try:
-        return (json.dumps(json.loads(left), sort_keys=True, ensure_ascii=False)
-                == json.dumps(json.loads(right), sort_keys=True, ensure_ascii=False))
+        return canonical(left) == canonical(right)
     except (ValueError, UnicodeError):
         return False
 
@@ -333,6 +362,8 @@ def send(transport, message, cwd=None):
     transport.fetch()
     config = load_config(transport)
     path = validate(message, config['repo'])
+    station = message['actor'].get('station')
+    require(station is None or station in config['stations'], f'actor.station {station!r} is not in stations.json')
     event = message['task']['event']
     if event in ADMISSION_EVENTS:
         if config.get('paused'):
@@ -394,20 +425,27 @@ def inbox(transport, actor=None, issue=None):
         require(LOGIN.fullmatch(login) and SLUG.fullmatch(agent), 'actor filter must be login/agent')
     tip = transport.fetch()
     config = load_config(transport, tip)
+    sources = [(transport.branch, tip, MESSAGES)]
+    for extra in config.get('also_watch', []):
+        legacy_tip = transport.fetch(extra['branch'], required=False)
+        if legacy_tip:
+            sources.append((extra['branch'], legacy_tip, extra['messages_dir']))
     records = []
-    for path, data in iter_messages(transport, tip):
-        status, sender = 'ok', None
-        try:
-            require(path == validate(data, config['repo']), 'path does not match actor and id')
-            sender = data['actor']['id']
-        except (ValueError, TypeError, KeyError):
-            status = 'invalid'
-        if actor is not None and sender != actor:
-            continue
-        task = data.get('task') if isinstance(data, dict) else None
-        if issue is not None and not (isinstance(task, dict) and task.get('issue') == issue):
-            continue
-        records.append({'path': path, 'status': status, 'attribution': 'self_reported', 'message': data})
+    for branch, revision, messages_dir in sources:
+        for path, data in iter_messages(transport, revision, messages_dir):
+            status, sender = 'ok', None
+            try:
+                require(path == validate(data, config['repo'], messages_dir), 'path does not match actor and id')
+                sender = data['actor']['id']
+            except (ValueError, TypeError, KeyError):
+                status = 'invalid'
+            if actor is not None and sender != actor:
+                continue
+            task = data.get('task') if isinstance(data, dict) else None
+            if issue is not None and not (isinstance(task, dict) and task.get('issue') == issue):
+                continue
+            records.append({'branch': branch, 'path': path, 'status': status, 'attribution': 'self_reported',
+                            'message': data})
     return {'observed_tip': tip, 'paused': config.get('paused', False), 'messages': records}
 
 
@@ -416,6 +454,12 @@ def inbox(transport, actor=None, issue=None):
 
 def sender_key(actor):
     return f"{str(actor.get('id', '?')).lower()}@{actor.get('station') or '?'}"
+
+
+def plain(value, limit=120):
+    """Untrusted message text made safe for one wake line: no control characters, bounded length."""
+    text = ''.join(c if c.isprintable() else ' ' for c in str(value))
+    return text if len(text) <= limit else text[:limit - 1] + '…'
 
 
 def route(config, sender):
@@ -434,20 +478,25 @@ def classify(message, me, config, local_branches):
     if not isinstance(task, dict):
         return None
     station, branch = actor.get('station'), task.get('branch')
+    if station is None and branch in local_branches:
+        return None  # legacy mail (no station) about a branch checked out here came from this station
     sender = sender_key(actor)
-    event, phase = task.get('event'), task.get('phase')
-    ref = f"#{task.get('issue')} {branch or '?'} @ {str(task.get('head', '?'))[:8]} from {sender} ({actor.get('session_id')})"
+    event, phase = plain(task.get('event'), 20), plain(task.get('phase') or '', 20)
+    ref = plain(f"#{task.get('issue')} {branch or '?'} @ {str(task.get('head', '?'))[:8]} "
+                f"from {sender} ({actor.get('session_id')})", 240)
     if event == 'review_requested':
         # Routing decides, even for the sender's own station: the reviewer is a fresh session either way.
-        return f"review needed: {task.get('pr_url', '?')} {ref}" if route(config, sender) == me else None
-    if station == me or (station is None and branch in local_branches):
+        return f"review needed: {plain(task.get('pr_url', '?'))} {ref}" if route(config, sender) == me else None
+    if event == 'handoff' and task.get('recipient_station') == me:
+        return plain(f"{phase or 'handoff'} {task.get('verdict') or ''} for this station: ".replace('  ', ' ')) + ref
+    if station == me:
         return None
     watch = config.get('watch', {})
     if any(fnmatch.fnmatchcase(sender, pattern.lower()) for pattern in watch.get('always_from', [])):
         return f'{event}/{phase or "-"} {ref}'
     if event == 'handoff':
-        if task.get('recipient_station') == me or branch in local_branches:
-            return f"{phase or 'handoff'} {task.get('verdict', '')} for this station: {ref}".replace('  ', ' ')
+        if branch in local_branches:
+            return plain(f"{phase or 'handoff'} {task.get('verdict') or ''} for this station: ".replace('  ', ' ')) + ref
         return None
     if event in watch.get('notify_events', DEFAULT_NOTIFY):
         return f'{event} {ref}'
@@ -493,9 +542,13 @@ def read_state(transport):
 
 
 def write_state(transport, state):
+    """Atomic replace, so a second watcher sharing this clone never reads half-written state."""
     path = transport.state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2) + '\n', encoding='utf-8')
+    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix='state-', suffix='.tmp')
+    with os.fdopen(handle, 'w', encoding='utf-8') as stream:
+        stream.write(json.dumps(state, indent=2) + '\n')
+    os.replace(temporary, path)
 
 
 def watch(transport, me, poll=60, once=False, out=sys.stdout):
@@ -509,6 +562,7 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
         if main_tip and main_tip != seen.get(transport.branch):
             config = load_config(transport, transport.fetch())  # pick up routing changes before classifying
         watched = [(transport.branch, MESSAGES)] + [(e['branch'], e['messages_dir']) for e in config.get('also_watch', [])]
+        advanced = {}
         for branch, messages_dir in watched:
             tip = main_tip if branch == transport.branch else transport.remote_tip(branch)
             if not tip or tip == seen.get(branch):
@@ -516,12 +570,16 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
             if transport.fetch(branch, required=False) is None:
                 continue
             found += scan(transport, config, me, seen.get(branch), tip, messages_dir)
-            seen[branch] = tip
-            write_state(transport, state)
+            advanced[branch] = tip
         if found:
             print('ACTIONABLE STATION MAIL:', file=out)
             for line in found:
                 print(line, file=out)
+            out.flush()
+        if advanced:  # only after the wake lines are out, so a failed print re-reports next time
+            seen.update(advanced)
+            write_state(transport, state)
+        if found:
             return EXIT_ACTIONABLE
         if once:
             return EXIT_QUIET
@@ -532,7 +590,11 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
 
 
 def archive_plan(transport, revision, config, now=None, issue_closed=None):
-    """Message paths eligible to leave the tip: older than after_days and their task resolved."""
+    """Message paths eligible to leave the tip: older than after_days and their task resolved.
+
+    A task is one (issue, branch) thread, so a parallel session on the same issue keeps its mail until
+    its own branch finishes. A closed issue resolves every thread on it.
+    """
     now = now or datetime.datetime.now(datetime.timezone.utc)
     cutoff = now - datetime.timedelta(days=config.get('archive', {}).get('after_days', 30))
     latest, entries = {}, []
@@ -542,27 +604,33 @@ def archive_plan(transport, revision, config, now=None, issue_closed=None):
             created = datetime.datetime.fromisoformat(data['created_at_utc'])
         except (TypeError, KeyError, ValueError):
             created = None
-        issue = task.get('issue') if isinstance(task, dict) else None
-        if issue is not None and created is not None and task.get('event') in EVENTS:
-            if issue not in latest or created >= latest[issue][0]:
-                latest[issue] = (created, task['event'])
-        entries.append((path, issue, created))
+        key = (task.get('issue'), task.get('branch')) if isinstance(task, dict) and task.get('issue') else None
+        if key and created is not None and task.get('event') in EVENTS:
+            # On a tie, finished wins.
+            rank = (created, task['event'] == 'finished')
+            if key not in latest or rank >= latest[key][0]:
+                latest[key] = (rank, task['event'])
+        entries.append((path, key, created))
     closed_cache = {}
 
-    def resolved(issue):
-        if issue is None:
+    def resolved(key):
+        if key is None:
             return True
-        if latest.get(issue, (None, None))[1] == 'finished':
+        if latest.get(key, (None, None))[1] == 'finished':
             return True
-        if issue not in closed_cache:
-            closed_cache[issue] = bool(issue_closed and issue_closed(issue))
-        return closed_cache[issue]
+        if key[0] not in closed_cache:
+            closed_cache[key[0]] = bool(issue_closed and issue_closed(key[0]))
+        return closed_cache[key[0]]
 
-    return sorted(path for path, issue, created in entries
-                  if created is not None and created < cutoff and resolved(issue))
+    return sorted(path for path, key, created in entries
+                  if created is not None and created < cutoff and resolved(key))
 
 
 def gh_issue_closed(repo):
+    if not shutil.which('gh'):
+        print('warning: gh not found; only tasks with a finished event are archived', file=sys.stderr)
+        return None
+
     def closed(issue):
         result = subprocess.run(['gh', 'issue', 'view', str(issue), '--repo', repo, '--json', 'state', '-q', '.state'],
                                 capture_output=True)
@@ -576,6 +644,7 @@ def archive(transport, actor_label, dry_run=False, now=None, issue_closed=None):
     paths = archive_plan(transport, tip, config, now, issue_closed or gh_issue_closed(config['repo']))
     if dry_run or not paths:
         return {'eligible': len(paths), 'paths': paths, 'archived': False}
+    require(actor_label, 'archive needs --login and --agent (or $STATION_MAIL_LOGIN / _AGENT)')
     day = (now or datetime.datetime.now(datetime.timezone.utc)).strftime('%Y-%m-%d')
     tag, n = ARCHIVE_TAG_PREFIX + day, 1
     while git(transport.root, 'ls-remote', '--tags', transport.remote, 'refs/tags/' + tag).stdout.strip():
@@ -697,6 +766,12 @@ def doctor(transport):
         check('station is listed in stations.json', me in config['stations'], ', '.join(config['stations']))
     for variable in ('STATION_MAIL_PERSON', 'STATION_MAIL_LOGIN', 'STATION_MAIL_AGENT', 'STATION_MAIL_SESSION'):
         check(f'{variable} set (or pass flags)', os.environ.get(variable), os.environ.get(variable, ''), False)
+    hooks_dir = Path(git(transport.root, 'rev-parse', '--git-path', 'hooks').stdout.strip())  # honours core.hooksPath
+    if not hooks_dir.is_absolute():
+        hooks_dir = transport.root / hooks_dir
+    pre_push = hooks_dir / 'pre-push'
+    has_reminder = pre_push.is_file() and 'review-reminder' in pre_push.read_text(encoding='utf-8', errors='replace')
+    check('pre-push hook runs review-reminder', has_reminder, str(pre_push), False)
     check('running in a linked worktree', is_linked_worktree(transport.root),
           'started, resumed and review_requested need one', False)
     gh = subprocess.run(['gh', 'auth', 'status'], capture_output=True) if shutil.which('gh') else None
@@ -821,6 +896,10 @@ def main(argv=None):
     commands.add_parser('doctor', help='check this machine and repository setup')
 
     args = parser.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        # Pipes on Windows default to the ANSI code page; message text may hold any Unicode.
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
     cwd = Path.cwd()
     transport = Transport(cwd, args.remote, args.branch)
     try:
@@ -841,9 +920,10 @@ def main(argv=None):
             if not base:
                 git(cwd, 'fetch', '--quiet', transport.remote, config['base_branch'], check=False)
                 base = git(cwd, 'merge-base', head, f"{transport.remote}/{config['base_branch']}").stdout.strip()
+            branch = args.branch_name or git(cwd, 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
+            require(branch != 'HEAD', 'Detached HEAD: pass --branch-name with the task branch')
             message = build_event(
-                repo=config['repo'], issue=args.issue, event=args.event, text=args.text,
-                branch=args.branch_name or git(cwd, 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip(),
+                repo=config['repo'], issue=args.issue, event=args.event, text=args.text, branch=branch,
                 base=base, head=head, person=args.person, login=args.login, agent=args.agent,
                 session=args.session, station=args.station or transport.setting('station'), to_agent=args.to,
                 message_id=args.id, phase=args.phase, verdict=args.verdict, pr_url=args.pr_url,
@@ -865,7 +945,8 @@ def main(argv=None):
                 return 0
             return watch(transport, me, args.poll, args.once)
         elif args.command == 'archive':
-            result = archive(transport, actor_label(args), args.dry_run)
+            label = f'{args.login.lower()}/{args.agent}' if args.login and args.agent else None
+            result = archive(transport, label, args.dry_run)
         elif args.command == 'config':
             if args.action == 'show':
                 result = load_config(transport, transport.fetch())
@@ -888,11 +969,11 @@ def main(argv=None):
                 mark = 'ok   ' if row['ok'] else ('FAIL ' if row['required'] else 'warn ')
                 print(mark + row['check'] + (f"  ({row['detail']})" if row['detail'] else ''))
             return 0 if all(r['ok'] for r in result if r['required']) else 1
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
     except (ValueError, RuntimeError, OSError) as error:
         print(str(error), file=sys.stderr)
         return 1
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-    return 0
 
 
 if __name__ == '__main__':

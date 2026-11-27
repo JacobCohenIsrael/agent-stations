@@ -21,7 +21,7 @@ python station_mail.py doctor
 
 `join` stores the station in the clone's local git config, which every linked worktree of that clone shares. `doctor` checks Python, git, the mailbox, `stations.json`, the station name, identity variables, the linked worktree, and gh authentication. FAIL lines block mail; warn lines are worth fixing.
 
-Per-machine watcher state (the last-seen commit for each watched branch) lives in `<git common dir>/agent-stations/state.json`, outside the working tree.
+Per-machine watcher state (the last-seen commit for each watched branch) lives in `<git common dir>/agent-stations/state.json`, outside the working tree. With no state yet, or if the recorded commit is gone, `watch` reports the last 24 hours of mail. Expect one catch-up wake on a new machine.
 
 ## stations.json
 
@@ -53,7 +53,7 @@ Per-machine watcher state (the last-seen commit for each watched branch) lives i
 - `review_routing`: each rule matches the sender `login/agent@station` (shell-style `*` wildcards) and names the station whose coordinator reviews that sender's PRs. The first match wins. A sender that matches no rule gets no automatic reviewer, so end the list with a catch-all `"*"` if every PR should be routed.
 - `watch.always_from`: senders whose every message wakes this coordinator. `notify_events`: events from other stations that wake it, `finished` and `paused` by default.
 - `usage_stop`: provider allowance floors that sessions honour before starting work. The tool stores them; agents read them.
-- `also_watch`: extra `{"branch", "messages_dir"}` mailboxes that `watch` reads, for migrating from an older mail branch.
+- `also_watch`: extra `{"branch", "messages_dir"}` mailboxes that `watch` and `inbox` read, for migrating from an older mail branch. Old messages have no station, so their sender key ends in `@?`. During the transition, add routing rules such as `{"from": "jacobcohenisrael/claude@?", "reviewer": "windows"}`. Legacy mail about a branch checked out on this machine always counts as this station's own.
 - `changes`: an append-only record of each config change (`at`, `by`, `quote`), written by `config apply`, `config pause` and `config resume`.
 
 Change config only on the human's own direct instruction, and quote it with `--quote`. `config pause --reason ... --quote ...` stops admission events on every station; `config resume --quote ...` lifts the pause.
