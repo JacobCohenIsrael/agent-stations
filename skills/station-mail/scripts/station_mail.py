@@ -18,6 +18,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import random
 from pathlib import Path
 import re
 import shutil
@@ -123,13 +124,13 @@ class Transport:
     def state_path(self):
         return self.common_dir().resolve() / 'agent-stations' / 'state.json'
 
-    def append(self, prepare, subject, attempts=5):
+    def append(self, prepare, subject, attempts=10):
         """Commit `prepare(tip)` changes ({path: bytes | None}) on the branch tip and push.
 
         `prepare` returns None when nothing needs writing (idempotent retry). A rejected
         push is retried from the new tip; the real checkout and index are never touched.
         """
-        for _ in range(attempts):
+        for attempt in range(attempts):
             tip = self.fetch()
             changes = prepare(tip)
             if changes is None:
@@ -157,6 +158,8 @@ class Transport:
                 return commit
             if self.remote_tip() == tip:
                 raise RuntimeError('Push failed without a competing update: ' + pushed.stderr.strip())
+            # Lost a race: back off with jitter so competing senders stop colliding in lockstep.
+            time.sleep(random.uniform(0.1, 0.4) * (attempt + 1))
         raise RuntimeError(f'{self.branch} stayed busy after {attempts} append attempts')
 
 
