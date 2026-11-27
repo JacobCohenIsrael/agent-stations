@@ -847,10 +847,18 @@ class StationsSharingOneClone(Fixture):
         legacy.parent.mkdir(parents=True, exist_ok=True)
         legacy.write_text(json.dumps({'last_seen': {'agent-stations': 'a' * 40}}), encoding='utf-8')
         self.assertEqual('a' * 40, mail.read_state(self.transport, 'windows')['last_seen']['agent-stations'])
-        mail.write_state(self.transport, 'windows', {'last_seen': {'agent-stations': 'b' * 40}})
+        state = mail.read_state(self.transport, 'windows')
+        state['last_seen']['agent-stations'] = 'b' * 40
+        mail.write_state(self.transport, 'windows', state)
         self.assertEqual('b' * 40, mail.read_state(self.transport, 'windows')['last_seen']['agent-stations'])
+        self.assertNotIn(mail.LEGACY_MARK, json.loads(self.transport.state_path('windows').read_text(encoding='utf-8')))
         self.assertFalse(legacy.exists(), 'the old single cursor is retired once handed over')
+        self.assertTrue(legacy.with_name('state.json.migrated').exists(), 'kept, renamed, for recovery')
         self.assertEqual({}, mail.read_state(self.transport, 'mac'), 'a later station starts fresh')
+        # An older copy of the tool sharing this clone writes state.json again: later writes leave it alone.
+        legacy.write_text(json.dumps({'last_seen': {'agent-stations': 'c' * 40}}), encoding='utf-8')
+        mail.write_state(self.transport, 'windows', mail.read_state(self.transport, 'windows'))
+        self.assertTrue(legacy.exists(), "an older watcher's live cursor survives")
 
     def test_a_malformed_station_is_refused(self):
         with unittest.mock.patch.dict(os.environ, {'STATION_MAIL_STATION': 'Windows '}):
@@ -942,6 +950,33 @@ class PingPong(Fixture):
             self.assertIsNone(mail.answer_ping(mac, config, 'mac', ping))
         with unittest.mock.patch.dict(os.environ, dict(self.who, STATION_MAIL_SESSION='mac-interactive')):
             self.assertIsNone(mail.answer_ping(mac, config, 'mac', ping), 'a second session sees it answered')
+
+    def test_paused_stations_still_answer_and_say_so(self):
+        config = mail.load_config(self.transport, self.transport.fetch())
+        mail.apply_config(self.transport, {**config, 'paused': True, 'pause_reason': 'test'}, 'jacob/claude',
+                          'windows', 'Jacob: pause for the test')
+        mail.send(self.transport, self.ping())
+        mac_primary, mac_root = self.clone('mac')
+        with unittest.mock.patch.dict(os.environ, self.who):
+            mail.watch(mail.Transport(mac_root), 'mac', once=True, out=io.StringIO())
+        tip = self.transport.fetch()
+        pong = next(json.loads(self.transport.show(tip, path))
+                    for path in run(self.root, 'ls-tree', '-r', '--name-only', tip).split() if '-pong-' in path)
+        self.assertIn('paused=True', pong['text'])
+
+    def test_a_self_ping_gets_one_pong_and_stops(self):
+        own = event(station='mac', kind='handoff', phase='ping', recipient_station='mac')
+        mail.send(self.transport, own)
+        mac_primary, mac_root = self.clone('mac')
+        mac = mail.Transport(mac_root)
+        with unittest.mock.patch.dict(os.environ, self.who):
+            mail.watch(mac, 'mac', once=True, out=io.StringIO())
+            out = io.StringIO()
+            mail.watch(mac, 'mac', once=True, out=out)
+            self.assertIn('pong', out.getvalue(), 'the pong wakes the pinging station')
+            self.assertEqual(mail.EXIT_QUIET, mail.watch(mac, 'mac', once=True, out=io.StringIO()))
+        tip = self.transport.fetch()
+        self.assertEqual(1, sum('-pong-' in path for path in run(self.root, 'ls-tree', '-r', '--name-only', tip).split()))
 
     def test_stationless_or_misaddressed_pings_are_not_answered(self):
         legacy = self.ping()

@@ -708,32 +708,43 @@ def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None
     return lines
 
 
+LEGACY_MARK = 'migrated_from_legacy'  # set in memory only; write_state consumes it
+
+
 def read_state(transport, station):
     # Before per-station cursors, one state.json served the clone's only station: start from it.
     for path in (transport.state_path(station), transport.legacy_state_path()):
         try:
-            return json.loads(path.read_text(encoding='utf-8'))
+            state = json.loads(path.read_text(encoding='utf-8'))
         except FileNotFoundError:
             continue
         except (OSError, ValueError):
             return {}
+        if not isinstance(state, dict):
+            return {}
+        if path == transport.legacy_state_path():
+            state[LEGACY_MARK] = True
+        return state
     return {}
 
 
 def write_state(transport, station, state):
     """Atomic replace, so a second watcher of this station never reads half-written state."""
     path = transport.state_path(station)
+    migrated = state.pop(LEGACY_MARK, False)
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary = tempfile.mkstemp(dir=path.parent, prefix='state-', suffix='.tmp')
     with os.fdopen(handle, 'w', encoding='utf-8') as stream:
         stream.write(json.dumps(state, indent=2) + '\n')
     os.replace(temporary, path)
-    # The old single cursor belonged to one station; once that station has its own file, retire it
-    # so a station added later starts with the usual 24-hour catch-up instead of inheriting it.
-    try:
-        transport.legacy_state_path().unlink()
-    except FileNotFoundError:
-        pass
+    if migrated:
+        # The old single cursor belonged to one station. Retire it once, on the write that took it over,
+        # so a station added later gets the usual 24-hour catch-up. A state.json written later by an
+        # older copy of the tool sharing this clone is left alone.
+        try:
+            os.replace(transport.legacy_state_path(), transport.legacy_state_path().with_name('state.json.migrated'))
+        except FileNotFoundError:
+            pass
 
 
 def watch(transport, me, poll=60, once=False, out=sys.stdout):
