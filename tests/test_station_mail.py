@@ -721,6 +721,66 @@ class WatchStartupAndRouting(Fixture):
         self.assertIn('pull/14', out.getvalue())
 
 
+
+class VerifiedRoutingReads(Fixture):
+    def legacy_branch_with_review(self):
+        legacy = self.base / 'legacy-reads'
+        run(self.base, 'clone', '-q', str(self.remote), str(legacy))
+        author(legacy)
+        run(legacy, 'checkout', '-q', '--orphan', 'old-mail')
+        run(legacy, 'rm', '-rqf', '.')
+        (legacy / 'README').write_text('legacy' + chr(10), encoding='utf-8')
+        run(legacy, 'add', '.')
+        run(legacy, 'commit', '-qm', 'start')
+        run(legacy, 'push', '-q', 'origin', 'old-mail')
+        config = mail.load_config(self.transport, self.transport.fetch())
+        config['also_watch'] = [{'branch': 'old-mail', 'messages_dir': 'docs/messages'}]
+        config['review_routing'].insert(0, {'from': 'jacob/codex@?', 'reviewer': 'windows'})
+        mail.apply_config(self.transport, config, 'jacob/claude', 'windows', 'Jacob: watch old mail')
+        mail.watch(self.transport, 'windows', once=True, out=io.StringIO())
+        request = event(station='mac', agent='codex', kind='review_requested', phase='ready_for_cr',
+                        pr_url='https://github.com/example/game/pull/15')
+        del request['actor']['station']
+        target = legacy / 'docs/messages/jacob/codex' / (request['id'] + '.json')
+        target.parent.mkdir(parents=True)
+        target.write_bytes(mail.payload_bytes(request))
+        run(legacy, 'add', '.')
+        run(legacy, 'commit', '-qm', 'legacy request')
+        run(legacy, 'push', '-q', 'origin', 'old-mail')
+
+    def test_primary_read_failure_does_not_hide_legacy_mail(self):
+        self.legacy_branch_with_review()
+        mail.send(self.transport, event(kind='finished'))  # advance the primary so it needs a scan
+        real = mail.Transport.show
+
+        def show(transport, revision, path):
+            if path.startswith('messages/'):
+                raise RuntimeError('simulated primary message read failure')
+            return real(transport, revision, path)
+        out = io.StringIO()
+        with unittest.mock.patch.object(mail.Transport, 'show', show):
+            self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(self.transport, 'windows', once=True, out=out))
+        self.assertIn('pull/15', out.getvalue())
+        state = mail.read_state(self.transport)['last_seen']
+        self.assertNotEqual(self.transport.remote_tip(), state.get('agent-stations'), 'failed primary keeps its cursor')
+
+    def test_config_read_failure_is_transient_but_absence_is_setup(self):
+        mail.send(self.transport, event(kind='finished'))
+        real_show, real_exists = mail.Transport.show, mail.Transport.exists
+
+        def show(transport, revision, path):
+            if path == mail.CONFIG_FILE:
+                raise RuntimeError('simulated blob read failure')
+            return real_show(transport, revision, path)
+        with unittest.mock.patch.object(mail.Transport, 'show', show):
+            self.assertEqual(mail.EXIT_INCOMPLETE, mail.watch(self.transport, 'windows', once=True, out=io.StringIO()))
+        with unittest.mock.patch.object(mail.Transport, 'exists',
+                                        lambda transport, revision, path: False if path == mail.CONFIG_FILE
+                                        else real_exists(transport, revision, path)):
+            with self.assertRaises(ValueError):
+                mail.watch(self.transport, 'windows', once=True, out=io.StringIO())
+
+
 class WorktreeReuseAndRereview(Fixture):
     def commit(self, root, name, text):
         (root / name).write_text(text, encoding='utf-8')

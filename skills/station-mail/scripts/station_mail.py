@@ -229,12 +229,12 @@ def validate_config(config):
 
 
 def load_config(transport, revision=None):
+    """stations.json at `revision`. A file that is truly absent is a setup error (ValueError); a failed
+    Git read stays a RuntimeError so pollers can treat it as transient and retry."""
     revision = revision or transport.ref()
-    try:
-        raw = transport.show(revision, CONFIG_FILE)
-    except RuntimeError:
-        raise ValueError(f'No {CONFIG_FILE} on {transport.remote}/{transport.branch}; run `init` first') from None
-    return validate_config(json.loads(raw))
+    if not transport.exists(revision, CONFIG_FILE):
+        raise ValueError(f'No {CONFIG_FILE} on {transport.remote}/{transport.branch}; run `init` first')
+    return validate_config(json.loads(transport.show(revision, CONFIG_FILE)))
 
 
 def config_bytes(config):
@@ -658,7 +658,8 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
             unreadable.append(branch)
 
         # Routing must be current before any cursor moves: classifying with stale routing and then
-        # advancing would silently drop mail that the new routing sends here.
+        # advancing would silently drop mail that the new routing sends here. Once routing is verified,
+        # each branch's messages are read independently.
         try:
             main_tip = transport.remote_tip(strict=True)
             if main_tip is None:
@@ -666,22 +667,21 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
             if main_tip != config_tip:
                 fetched = transport.fetch()
                 config, config_tip = load_config(transport, fetched), fetched
-                if fetched != main_tip:  # the branch moved between lookup and fetch; scan what was fetched
-                    main_tip = fetched
+            main_tip = config_tip  # scan exactly the revision whose routing was loaded; no second fetch
         except RuntimeError as error:
             incomplete(transport.branch, error)
-        watched = [(transport.branch, MESSAGES)]
-        if not unreadable:
-            watched += [(e['branch'], e['messages_dir']) for e in config.get('also_watch', [])]
+            config_tip = None  # force a fresh routing load next poll
+        watched = []
+        if not unreadable:  # routing verified
+            watched = [(transport.branch, MESSAGES)] + [(e['branch'], e['messages_dir'])
+                                                         for e in config.get('also_watch', [])]
         for branch, messages_dir in watched:
-            if transport.branch in unreadable:
-                break
             try:
                 # A failed lookup or fetch is an incomplete poll; only a branch the remote truly lacks is quiet.
                 tip = main_tip if branch == transport.branch else transport.remote_tip(branch, strict=True)
                 if not tip or tip == seen.get(branch):
                     continue
-                if transport.fetch(branch, required=False) is None:
+                if branch != transport.branch and transport.fetch(branch, required=False) is None:
                     raise RuntimeError(f'fetch of {transport.remote}/{branch} at {tip} failed')
                 found += scan(transport, config, me, seen.get(branch), tip, messages_dir)
             except RuntimeError as error:
