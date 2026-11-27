@@ -539,7 +539,7 @@ class CodexRereviewRepairs(Fixture):
                 raise RuntimeError('simulated read failure')
             return real_show(transport, revision, path)
         with unittest.mock.patch.object(mail.Transport, 'show', failing):
-            self.assertEqual(mail.EXIT_QUIET, mail.watch(mac_transport, 'mac', once=True, out=io.StringIO()))
+            self.assertEqual(mail.EXIT_INCOMPLETE, mail.watch(mac_transport, 'mac', once=True, out=io.StringIO()))
         out = io.StringIO()
         self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(mac_transport, 'mac', once=True, out=out))
         self.assertIn('pull/6', out.getvalue())
@@ -550,6 +550,53 @@ class CodexRereviewRepairs(Fixture):
                     {**config, 'watch': None}, {**config, 'changes': None}):
             with self.assertRaises(ValueError):
                 mail.validate_config(bad)
+
+
+
+class CodexThirdPassRepairs(Fixture):
+    routing = {'review_routing': [{'from': '*', 'reviewer': 'windows'}]}
+
+    def legacy_push(self, branch, files):
+        legacy = self.base / ('legacy-' + branch)
+        run(self.base, 'clone', '-q', str(self.remote), str(legacy))
+        author(legacy)
+        run(legacy, 'checkout', '-q', '--orphan', branch)
+        run(legacy, 'rm', '-rqf', '.')
+        for path, content in files.items():
+            target = legacy / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        run(legacy, 'add', '.')
+        run(legacy, 'commit', '-qm', 'legacy mail')
+        run(legacy, 'push', '-q', 'origin', branch)
+
+    def test_cutover_keeps_a_sibling_repository_pr(self):
+        request = event(station='mac', kind='review_requested', phase='ready_for_cr',
+                        pr_url='https://github.com/example/game-skills/pull/1')
+        del request['actor']['station']
+        path = 'docs/messages/jacob/claude/' + request['id'] + '.json'
+        self.legacy_push('old-mail', {path: mail.payload_bytes(request)})
+        config = mail.load_config(self.transport, self.transport.fetch())
+        config['also_watch'] = [{'branch': 'old-mail', 'messages_dir': 'docs/messages'}]
+        config['review_routing'] = [{'from': 'jacob/claude@?', 'reviewer': 'windows'}]
+        mail.apply_config(self.transport, config, 'jacob/claude', 'windows', 'Jacob: cutover')
+        out = io.StringIO()
+        self.assertEqual(mail.EXIT_ACTIONABLE, mail.watch(self.transport, 'windows', once=True, out=out))
+        self.assertIn('https://github.com/example/game-skills/pull/1', out.getvalue())
+
+    def test_long_pr_url_is_printed_whole(self):
+        url = 'https://github.com/' + 'o' * 39 + '/' + 'r' * 100 + '/pull/1234567'
+        request = event(station='mac', kind='review_requested', phase='ready_for_cr', pr_url=url)
+        self.assertIn(url, mail.classify(request, 'windows', self.routing, set()))
+
+    def test_deeply_nested_or_misplaced_mail_is_skipped(self):
+        good = event(station='mac', kind='review_requested', phase='ready_for_cr',
+                     pr_url='https://github.com/example/game/pull/2')
+        canonical = 'messages/jacob/claude/' + good['id'] + '.json'
+        nested = ('[' * 100000 + ']' * 100000).encode()
+        self.assertIsNone(mail.readable(nested, 'messages/x/y/z.json', REPO))
+        self.assertIsNotNone(mail.readable(mail.payload_bytes(good), canonical, REPO))
+        self.assertIsNone(mail.readable(mail.payload_bytes(good), 'messages/jacob/claude/copy.json', REPO))
 
 
 class WorktreeReuseAndRereview(Fixture):

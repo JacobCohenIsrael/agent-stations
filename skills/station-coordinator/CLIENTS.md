@@ -11,7 +11,7 @@ The watcher is the same on every client: `station_mail.py watch --poll 60` exits
 
 ## Codex
 
-- **Watcher**: run `station_mail.py watch --once` from the client's scheduled automation (for example every 10 minutes). Exit 0 means act on the printed lines; exit 3 means nothing new.
+- **Watcher**: run `station_mail.py watch --once` from the client's scheduled automation (for example every 10 minutes). Exit 0 means act on the printed lines, 3 means nothing new, 4 means a mailbox branch couldn't be read: report it to the human (its cursor stays put, so the next run retries), and 1 is any other error.
 - **Reviewers and executors**: a new task per review or issue, with the same brief contents as above.
 
 ## Any other client

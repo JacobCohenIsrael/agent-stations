@@ -51,9 +51,11 @@ SAFE_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z')
 LOGIN = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?\Z')
 REPO = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}\Z')
 SHA = re.compile(r'[0-9a-fA-F]{40}\Z')
+PR_URL = re.compile(r'https://github\.com/[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}/pull/[1-9][0-9]{0,9}\Z')
 
 EXIT_ACTIONABLE = 0
 EXIT_QUIET = 3
+EXIT_INCOMPLETE = 4
 
 
 # --------------------------------------------------------------------------- git
@@ -297,9 +299,10 @@ def validate(message, repo, messages_dir=MESSAGES, strict=False):
     phase = task.get('phase')
     require(phase is None or (isinstance(phase, str) and SLUG.fullmatch(phase.replace('_', '-'))), 'Unsafe task.phase')
     require(task.get('verdict') is None or task['verdict'] in VERDICTS, 'Unknown task.verdict')
-    require(task.get('pr_url') is None or (isinstance(task['pr_url'], str) and re.fullmatch(
-        rf'https://github\.com/{re.escape(repo)}/pull/[1-9][0-9]*', task['pr_url'])),
-        'pr_url must be a pull request URL of the configured repository')
+    # The PR may live in a sibling repository (a library or skill repo tracked by this repo's issue);
+    # the coordinator verifies it natively before acting.
+    require(task.get('pr_url') is None or (isinstance(task['pr_url'], str) and PR_URL.fullmatch(task['pr_url'])),
+            'pr_url must be a GitHub pull request URL')
     require(task.get('review_head') is None or task['review_head'] == task['head'], 'review_head must equal head')
     for field in ('recipient_station',):
         require(task.get(field) is None or (isinstance(task[field], str) and SLUG.fullmatch(task[field])),
@@ -463,13 +466,29 @@ def send(transport, message, cwd=None):
 # ------------------------------------------------------------------------- inbox
 
 
+def readable(raw, path, repo, messages_dir=MESSAGES):
+    """The message in `raw` if it is well formed and stored at its canonical path, else None.
+
+    Shared by inbox and watch so both readers agree on which records exist. Malformed or misplaced
+    mail is skipped; it never stops a reader.
+    """
+    try:
+        message = json.loads(raw)
+        if validate(message, repo, messages_dir) != path:
+            return None
+        return message
+    except (ValueError, UnicodeError, TypeError, AttributeError, KeyError, RecursionError):
+        return None
+
+
 def iter_messages(transport, revision, messages_dir=MESSAGES):
     listing = git(transport.root, 'ls-tree', '-rz', '--name-only', revision, '--', messages_dir).stdout
     for path in listing.split('\0'):
         if path.endswith('.json'):
+            raw = transport.show(revision, path)
             try:
-                yield path, json.loads(transport.show(revision, path))
-            except (ValueError, UnicodeError):
+                yield path, json.loads(raw)
+            except (ValueError, UnicodeError, RecursionError):
                 yield path, None
 
 
@@ -492,7 +511,7 @@ def inbox(transport, actor=None, issue=None):
             try:
                 require(path == validate(data, config['repo'], messages_dir), 'path does not match actor and id')
                 sender = data['actor']['id']
-            except (ValueError, TypeError, KeyError):
+            except (ValueError, TypeError, KeyError, AttributeError):
                 status = 'invalid'
             if actor is not None and sender != actor:
                 continue
@@ -549,7 +568,7 @@ def classify(message, me, config, local_branches):
         if not task.get('pr_url'):
             return None  # not a usable review request
         # Routing decides, even for the sender's own station: the reviewer is a fresh session either way.
-        return f"review needed: {plain(task.get('pr_url', '?'))} {ref}" if route(config, sender) == me else None
+        return f"review needed: {plain(task['pr_url'], 200)} {ref}" if route(config, sender) == me else None
     if event == 'handoff' and task.get('recipient_station') == me:
         return plain(f"{phase or 'handoff'} {task.get('verdict') or ''} for this station: ".replace('  ', ' ')) + ref
     if station == me:
@@ -586,12 +605,8 @@ def scan(transport, config, me, start, end, messages_dir=MESSAGES, branches=None
             status, _, path = row.partition('\t')
             if status == 'A' and path.startswith(messages_dir + '/') and path.endswith('.json'):
                 raw = transport.show(commit, path)  # a failed read raises, so the cursor stays put
-                try:
-                    message = json.loads(raw)
-                    validate(message, config['repo'], messages_dir)
-                    reason = classify(message, me, config, branches)
-                except (ValueError, UnicodeError, TypeError, AttributeError, KeyError):
-                    reason = None  # malformed mail is skipped and never blocks the cursor
+                message = readable(raw, path, config['repo'], messages_dir)
+                reason = classify(message, me, config, branches) if message is not None else None
                 if reason:
                     lines.append(f'{commit[:9]} {reason}')
             elif path == CONFIG_FILE and status == 'M':
@@ -629,7 +644,7 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
         if main_tip and main_tip != seen.get(transport.branch):
             config = load_config(transport, transport.fetch())  # pick up routing changes before classifying
         watched = [(transport.branch, MESSAGES)] + [(e['branch'], e['messages_dir']) for e in config.get('also_watch', [])]
-        advanced = {}
+        advanced, unreadable = {}, []
         for branch, messages_dir in watched:
             tip = main_tip if branch == transport.branch else transport.remote_tip(branch)
             if not tip or tip == seen.get(branch):
@@ -639,7 +654,8 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
             try:
                 found += scan(transport, config, me, seen.get(branch), tip, messages_dir)
             except RuntimeError as error:
-                print(f'warning: could not read {branch}; will retry: {error}', file=sys.stderr)
+                print(f'warning: could not read {branch}; its cursor stays put for a retry: {error}', file=sys.stderr)
+                unreadable.append(branch)
                 continue
             advanced[branch] = tip
         if found:
@@ -653,7 +669,7 @@ def watch(transport, me, poll=60, once=False, out=sys.stdout):
         if found:
             return EXIT_ACTIONABLE
         if once:
-            return EXIT_QUIET
+            return EXIT_INCOMPLETE if unreadable else EXIT_QUIET
         time.sleep(poll)
 
 
@@ -1068,7 +1084,7 @@ def main(argv=None):
     p.add_argument('--actor', help='sender login/agent')
     p.add_argument('--issue', type=int)
 
-    p = commands.add_parser('watch', help='wait for mail this station must act on; exit 0 with it, 3 when --once is quiet')
+    p = commands.add_parser('watch', help='wait for mail this station must act on; exit 0 with it; with --once, 3 when quiet, 4 when a branch could not be read')
     p.add_argument('--poll', type=int, default=60, help='seconds between ls-remote checks')
     p.add_argument('--once', action='store_true')
     p.add_argument('--range', help='FROM..TO: print the classification only, no state change')

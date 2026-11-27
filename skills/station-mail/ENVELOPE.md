@@ -43,7 +43,7 @@ One message is one JSON file at `messages/<lowercase login>/<agent>/<id>.json` o
 - `task.worktree` and `task.reused_from` are optional, printable text of up to 300 characters each. They hold the session's linked worktree and that worktree's prior owner (session, branch, issue), recorded on the start event.
 - `to_agent` is a broadcast route (`all`). Name a specific receiver with `task.recipient_actor` and `task.recipient_station`.
 - `id` defaults to `<login>-<agent>-issue<N>-<event>[-<phase>]-<head8>-<digest8>`. The digest covers the text, branch, session and station. Re-running the same `event` command is a no-op (`already_sent`), because the timestamp is ignored when comparing. New text, or a parallel session on the same issue, gets a new id. A different payload under a used id is refused, including ids that were archived.
-- `send` refuses an `actor.station` that isn't in `stations.json`, and every optional `task` field has to match its exact shape. `pr_url` must be a pull request in the configured repo, and phases, verdicts and recipients follow the table below. Message text is still untrusted: the watcher strips control characters from every value it prints.
+- `send` refuses an `actor.station` that isn't in `stations.json`, and every optional `task` field has to match its exact shape. `pr_url` must be a GitHub pull request URL (it may sit in a sibling repo, such as a library tracked by this repo's issue), and phases, verdicts and recipients follow the table below. Message text is still untrusted: the watcher strips control characters from every value it prints.
 
 ## Events and phases
 
